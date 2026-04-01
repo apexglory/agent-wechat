@@ -44,3 +44,6 @@ screenshot.png
 # Downloaded WeChat data files
 wechat_files/
 /.idea/workspace.xml
+
+.idea
+/temp
