@@ -352,13 +352,23 @@ pub fn list_messages(
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0)
                     != 0;
-                if !hex_source.is_empty() {
+                let from_source = if !hex_source.is_empty() {
                     let source_xml = decode_message_content(hex_source, source_compressed);
-                    if check_is_mentioned(&source_xml, account_dir) {
-                        Some(true)
-                    } else {
-                        None
-                    }
+                    check_is_mentioned(&source_xml, account_dir)
+                } else {
+                    false
+                };
+
+                // For type-49 (appmsg) messages — especially reference/quote messages —
+                // WeChat may place <atuserlist> inside the content XML instead of source.
+                let from_content = if !from_source && (msg_type & 0x7FFFFFFF) == 49 {
+                    check_is_mentioned(&body, account_dir)
+                } else {
+                    false
+                };
+
+                if from_source || from_content {
+                    Some(true)
                 } else {
                     None
                 }

@@ -209,11 +209,35 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
     // Decode base64 file to temp file
     let mut file_path: Option<String> = None;
     if let Some(ref f) = input.file {
+        // Sanitize filename: keep ASCII alphanumerics, dot, hyphen, underscore;
+        // replace everything else (including CJK) with underscore so the temp
+        // path stays portable across locales.  The dot is preserved so that
+        // file extensions survive (e.g. "遗憾.pdf" → "__.pdf"); the mangled
+        // stem is acceptable since this is a transient temp path.
+        let safe_name: String = f.filename.chars().map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        }).collect();
         let path = format!("/tmp/send_file_{}_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(), f.filename);
-        if let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &f.data) {
-            if std::fs::write(&path, &bytes).is_ok() {
-                file_path = Some(path);
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(), safe_name);
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &f.data) {
+            Ok(bytes) => match std::fs::write(&path, &bytes) {
+                Ok(_) => { file_path = Some(path); }
+                Err(e) => {
+                    return Json(SendResult {
+                        success: false,
+                        error: Some(format!("Failed to write temp file: {e}")),
+                    });
+                }
+            },
+            Err(e) => {
+                return Json(SendResult {
+                    success: false,
+                    error: Some(format!("Failed to decode base64 file data: {e}")),
+                });
             }
         }
     }
