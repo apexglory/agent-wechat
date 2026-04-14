@@ -54,11 +54,16 @@ cleanup_build_context() {
 build_arch() {
   local platform="$1"
   local tag="$2"
+  local build_args=()
 
   echo "==> Building ${tag} (${platform})"
   echo "    WeChat .deb will be downloaded inside Docker build"
+  if [ "$NO_CACHE" -eq 1 ]; then
+    build_args+=(--no-cache)
+  fi
+
   docker buildx build \
-    ${NO_CACHE:+--no-cache} \
+    "${build_args[@]}" \
     --platform "$platform" \
     --build-arg BUILD_MODE="$BUILD_MODE" \
     -t "$tag" \
