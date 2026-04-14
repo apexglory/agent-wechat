@@ -15,6 +15,7 @@ CACHE_VOLUME="agent-wechat-cargo-cache"
 
 CONTAINER=""
 BUILD_MODE="debug"
+CARGO_CONFIG_MOUNT=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -64,12 +65,23 @@ if [ "$BUILD_MODE" = "debug" ]; then
   BINARY_DIR="debug"
 fi
 
+# Docker cannot create a nested mountpoint under a read-only bind mount,
+# so make sure the source tree already contains /build/target.
+mkdir -p "$RUST_DIR/target"
+
+# Reuse host Cargo registry configuration (for mirrors, auth, etc.) inside
+# the builder container when present.
+if [ -f "$HOME/.cargo/config.toml" ]; then
+  CARGO_CONFIG_MOUNT=(-v "$HOME/.cargo/config.toml:/usr/local/cargo/config.toml:ro")
+fi
+
 echo "==> Building in Docker ($PLATFORM, mode=$BUILD_MODE)"
 docker run --rm \
   --platform "$PLATFORM" \
   -v "$RUST_DIR:/build:ro" \
   -v "$CACHE_VOLUME:/build/target" \
   -v "${CACHE_VOLUME}-registry:/usr/local/cargo/registry" \
+  "${CARGO_CONFIG_MOUNT[@]}" \
   -w /build \
   "$BUILDER_IMAGE" \
   cargo build $CARGO_ARGS

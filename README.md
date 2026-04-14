@@ -145,3 +145,13 @@ See [CLAUDE.md](./CLAUDE.md) for full technical documentation.
 | Port | Service |
 |------|---------|
 | 6174 | Agent server REST API + VNC web viewer at `/vnc/` |
+
+
+# 1. 进入容器查看 VNC 进程
+docker exec agent-wechat ps aux | grep -i vnc
+
+# 2. 关闭原 VNC 进程 (PID 47)
+docker exec agent-wechat kill 47
+
+# 3. 重启 VNC（去掉 -viewonly）
+docker exec -d agent-wechat x11vnc -display :99 -forever -nopw -shared -xkb -rfbport 5900 -listen 127.0.0.1
