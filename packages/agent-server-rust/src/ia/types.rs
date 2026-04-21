@@ -136,6 +136,8 @@ pub struct MainWindowState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opened_chat_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub opened_chat_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub opened_chat_is_group: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_chat_bounds: Option<Bounds>,
@@ -200,6 +202,7 @@ impl Default for AppState {
                 search_query: None,
                 search_results: None,
                 opened_chat_name: None,
+                opened_chat_username: None,
                 opened_chat_is_group: None,
                 selected_chat_bounds: None,
                 close_button_bounds: None,

@@ -61,6 +61,29 @@ fn find_selected_chat_item(a11y: &A11yNode) -> Option<&A11yNode> {
     })
 }
 
+fn same_bounds(a: &Option<Bounds>, b: &Option<Bounds>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn should_preserve_opened_chat_username(
+    prev: &AppState,
+    opened_chat_name: &Option<String>,
+    opened_chat_is_group: bool,
+    selected_chat_bounds: &Option<Bounds>,
+) -> bool {
+    matches!(prev.main_window.view, MainWindowView::ChatOpen)
+        && prev.main_window.opened_chat_username.is_some()
+        && prev.main_window.opened_chat_name == *opened_chat_name
+        && prev.main_window.opened_chat_is_group == Some(opened_chat_is_group)
+        && same_bounds(&prev.main_window.selected_chat_bounds, selected_chat_bounds)
+}
+
 /// Chat state — no chat selected.
 struct ChatState;
 
@@ -97,6 +120,7 @@ impl IAState for ChatState {
         state.main_window.view = MainWindowView::Chat;
         state.main_window.is_logged_in = true;
         state.main_window.opened_chat_name = None;
+        state.main_window.opened_chat_username = None;
         state.main_window.opened_chat_is_group = None;
         state.main_window.selected_chat_bounds = None;
         state.main_window.close_button_bounds = wb.close_button_bounds;
@@ -192,6 +216,17 @@ impl IAState for ChatOpenState {
         state.main_window.is_logged_in = true;
         state.main_window.selected_chat_id = selected_chat_id;
         state.main_window.opened_chat_name = opened_chat_name;
+        state.main_window.opened_chat_username =
+            if should_preserve_opened_chat_username(
+                args.prev,
+                &state.main_window.opened_chat_name,
+                is_group,
+                &selected_chat_bounds,
+            ) {
+                args.prev.main_window.opened_chat_username.clone()
+            } else {
+                None
+            };
         state.main_window.opened_chat_is_group = Some(is_group);
         state.main_window.selected_chat_bounds = selected_chat_bounds;
         state.main_window.close_button_bounds = wb.close_button_bounds;
@@ -215,3 +250,90 @@ fn collect_labels<'a>(node: &'a A11yNode, out: &mut Vec<&'a A11yNode>) {
 
 pub static CHAT_STATES: std::sync::LazyLock<Vec<Box<dyn IAState>>> =
     std::sync::LazyLock::new(|| vec![Box::new(ChatState), Box::new(ChatOpenState)]);
+
+#[cfg(test)]
+mod tests {
+    use super::{same_bounds, should_preserve_opened_chat_username};
+    use crate::ia::types::{AppState, Bounds, MainWindowView};
+
+    #[test]
+    fn preserve_opened_chat_username_when_same_chat_stays_open() {
+        let mut prev = AppState::default();
+        prev.main_window.view = MainWindowView::ChatOpen;
+        prev.main_window.opened_chat_name = Some("文件传输助手".to_string());
+        prev.main_window.opened_chat_username = Some("filehelper".to_string());
+        prev.main_window.opened_chat_is_group = Some(false);
+        prev.main_window.selected_chat_bounds = Some(Bounds {
+            x: 12.0,
+            y: 34.0,
+            width: 56.0,
+            height: 78.0,
+        });
+
+        assert!(should_preserve_opened_chat_username(
+            &prev,
+            &Some("文件传输助手".to_string()),
+            false,
+            &Some(Bounds {
+                x: 12.0,
+                y: 34.0,
+                width: 56.0,
+                height: 78.0,
+            }),
+        ));
+    }
+
+    #[test]
+    fn clear_opened_chat_username_when_chat_fingerprint_changes() {
+        let mut prev = AppState::default();
+        prev.main_window.view = MainWindowView::ChatOpen;
+        prev.main_window.opened_chat_name = Some("文件传输助手".to_string());
+        prev.main_window.opened_chat_username = Some("filehelper".to_string());
+        prev.main_window.opened_chat_is_group = Some(false);
+        prev.main_window.selected_chat_bounds = Some(Bounds {
+            x: 12.0,
+            y: 34.0,
+            width: 56.0,
+            height: 78.0,
+        });
+
+        assert!(!should_preserve_opened_chat_username(
+            &prev,
+            &Some("APEX_GLORY".to_string()),
+            false,
+            &prev.main_window.selected_chat_bounds,
+        ));
+    }
+
+    #[test]
+    fn same_bounds_requires_exact_shape_match() {
+        assert!(same_bounds(
+            &Some(Bounds {
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 4.0,
+            }),
+            &Some(Bounds {
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 4.0,
+            }),
+        ));
+        assert!(!same_bounds(
+            &Some(Bounds {
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 4.0,
+            }),
+            &Some(Bounds {
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 5.0,
+            }),
+        ));
+    }
+}

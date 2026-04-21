@@ -1,5 +1,6 @@
 import type { ResolvedWeChatAccount } from "./types.js";
 import { WeChatClient } from "@agent-wechat/shared";
+import { runSerializedWeChatOperation } from "./operation-queue.ts";
 
 function createClient(account: ResolvedWeChatAccount) {
   return new WeChatClient({
@@ -225,10 +226,15 @@ export function createWeChatReceiveTransferTool(account: ResolvedWeChatAccount) 
       }
 
       try {
-        const result = await client.receiveTransfer(
-          chatId,
-          transactionId,
-          localId,
+        const result = await runSerializedWeChatOperation(
+          account.accountId,
+          `receive transfer in ${chatId}`,
+          () =>
+            client.receiveTransfer(
+              chatId,
+              transactionId,
+              localId,
+            ),
         );
         const amount = result.amountText ? ` ${result.amountText}` : "";
         const details = [
