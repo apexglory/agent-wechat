@@ -199,6 +199,11 @@ pub async fn open_chat(
         run_execution_loop(&plan, &params, &mut context, &noop_emit, cancel).await;
 
     if result.success {
+        context.state.main_window.opened_chat_username = Some(params.chat_id.clone());
+        {
+            let db = get_db();
+            context.save(&db);
+        }
         if let Some(open_result) = plan_state.result {
             Json(serde_json::to_value(open_result).unwrap_or_else(|_| serde_json::json!({"ok": true})))
         } else {

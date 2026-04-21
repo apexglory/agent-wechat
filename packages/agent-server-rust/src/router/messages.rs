@@ -261,6 +261,14 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
     let (result, _plan_state) =
         run_execution_loop(&plan, &params, &mut context, &noop_emit, cancel).await;
 
+    if result.success {
+        context.state.main_window.opened_chat_username = Some(params.chat_id.clone());
+        {
+            let db = get_db();
+            context.save(&db);
+        }
+    }
+
     // Clean up temp files
     if let Some(p) = &image_path {
         let _ = std::fs::remove_file(p);

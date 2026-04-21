@@ -117,6 +117,14 @@ impl Plan for SendMessagePlan {
                         return None;
                     }
 
+                    if main_state_id == Some("chat_open")
+                        && state.main_window.opened_chat_username.as_deref()
+                            == Some(params.chat_id.as_str())
+                    {
+                        plan_state.phase = SendMessagePhase::Focusing;
+                        continue;
+                    }
+
                     let chat_list_item = query_selector(a11y, r#"list[name="Chats"] > list-item"#);
                     let click_xy = chat_list_item.and_then(|item| {
                         item.bounds.as_ref().map(|b| (
