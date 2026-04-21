@@ -177,6 +177,7 @@ export const wechatPlugin: ChannelPlugin<ResolvedWeChatAccount> = {
       const client = new WeChatClient({ baseUrl: account.serverUrl, token: account.token });
       const result = await runSerializedWeChatOperation(
         account.accountId,
+        to,
         `send text to ${to}`,
         () => client.sendMessage({ chatId: to, text }),
       );
@@ -199,6 +200,7 @@ export const wechatPlugin: ChannelPlugin<ResolvedWeChatAccount> = {
       if (mediaUrl) {
         const result = await runSerializedWeChatOperation(
           account.accountId,
+          to,
           `send media to ${to}`,
           async () => {
             const fsmod = await import("fs/promises");
@@ -251,6 +253,7 @@ export const wechatPlugin: ChannelPlugin<ResolvedWeChatAccount> = {
       // Text-only fallback
       const result = await runSerializedWeChatOperation(
         account.accountId,
+        to,
         `send text to ${to}`,
         () => client.sendMessage({
           chatId: to,

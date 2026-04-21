@@ -694,6 +694,7 @@ async function dispatchSegment(
         deliver: async (payload: any) =>
           runSerializedWeChatOperation(
             liveAccount.accountId,
+            chatId,
             `deliver reply to ${chatId}`,
             async () => {
               const mediaList: string[] = payload.mediaUrls?.length
@@ -899,6 +900,7 @@ async function processUnreadChat(
   const processed = hasNonTextMessages
     ? await runSerializedWeChatOperation(
         liveAccount.accountId,
+        chatId,
         `prepare non-text messages in ${chatId}`,
         () =>
           prepareMessagesForChat(

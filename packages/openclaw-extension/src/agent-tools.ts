@@ -228,6 +228,7 @@ export function createWeChatReceiveTransferTool(account: ResolvedWeChatAccount) 
       try {
         const result = await runSerializedWeChatOperation(
           account.accountId,
+          chatId,
           `receive transfer in ${chatId}`,
           () =>
             client.receiveTransfer(
