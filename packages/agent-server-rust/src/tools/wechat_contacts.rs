@@ -20,6 +20,7 @@ const SYSTEM_USERNAMES: &[&str] = &[
     "exmail_tool",
     "lbsapp",
     "pc_qq",
+    "brandservicesessionholder",
 ];
 
 fn classify_contact(username: &str, local_type: i64) -> &'static str {

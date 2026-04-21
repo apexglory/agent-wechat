@@ -12,6 +12,11 @@ import {
   resolveWeChatPolicyContext,
   type WeChatPolicyContext,
 } from "./access-control.js";
+import {
+  isAutomationIgnoredChatId,
+  requiresChatOpenForMessages,
+} from "./automation-filter.js";
+import { runSerializedWeChatOperation } from "./operation-queue.ts";
 
 // Message types that may have downloadable media
 const MEDIA_TYPES = new Set([3, 34, 43]); // image, voice, video
@@ -42,11 +47,6 @@ type ProcessedMessage = {
   hasMedia: boolean;
   isMentioned: boolean;
 };
-
-/** Official/service accounts have IDs starting with gh_ */
-function isOfficialAccount(chatId: string): boolean {
-  return chatId.startsWith("gh_");
-}
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -195,9 +195,9 @@ export async function startWeChatMonitor(
         continue;
       }
 
-      // Filter to chats with unreads (skip official accounts)
+      // Filter to chats with unreads (skip system / service accounts)
       const unreadChats = chats.filter(
-        (c) => c.unreadCount > 0 && !isOfficialAccount(c.username ?? c.id),
+        (c) => c.unreadCount > 0 && !isAutomationIgnoredChatId(c.username ?? c.id),
       );
       if (unreadChats.length > 0) {
         log?.info?.(
@@ -208,6 +208,11 @@ export async function startWeChatMonitor(
       if (unreadChats.length > 0) {
         for (const chat of unreadChats) {
           if (abortSignal.aborted) break;
+          const chatId = chat.username ?? chat.id;
+          const prevSeen = lastSeenId.get(chatId);
+          if (prevSeen !== undefined && chat.lastMsgLocalId && chat.lastMsgLocalId <= prevSeen) {
+            continue;
+          }
           await processUnreadChat(
             client,
             chat,
@@ -226,7 +231,7 @@ export async function startWeChatMonitor(
       for (const chat of chats) {
         if (abortSignal.aborted) break;
         const chatId = chat.username ?? chat.id;
-        if (isOfficialAccount(chatId)) continue; // skip official accounts
+        if (isAutomationIgnoredChatId(chatId)) continue; // skip system / official accounts
         const prevSeen = lastSeenId.get(chatId);
         if (prevSeen === undefined) continue; // not tracked yet
         if (unreadChats.some((c) => (c.username ?? c.id) === chatId)) continue; // already processed
@@ -387,6 +392,45 @@ async function prepareMessage(
     hasMedia,
     isMentioned: wasMentioned,
   };
+}
+
+async function prepareMessagesForChat(
+  client: WeChatClient,
+  newMessages: Message[],
+  chatId: string,
+  chat: Chat,
+  liveAccount: ResolvedWeChatAccount,
+  policy: WeChatPolicyContext,
+  shouldOpen: boolean,
+  log?: { info?: (...args: any[]) => void; error?: (...args: any[]) => void },
+): Promise<ProcessedMessage[] | null> {
+  if (shouldOpen) {
+    log?.info?.(
+      `[wechat:${liveAccount.accountId}] Opening chat ${chatId} for non-text message processing...`,
+    );
+    try {
+      await client.openChat(chatId, true);
+      log?.info?.(`[wechat:${liveAccount.accountId}] Opened chat ${chatId}`);
+    } catch (err) {
+      log?.error?.(
+        `[wechat:${liveAccount.accountId}] Failed to open chat ${chatId}: ${err}`,
+      );
+      return null;
+    }
+  }
+
+  const processed: ProcessedMessage[] = [];
+  for (const msg of newMessages) {
+    log?.info?.(
+      `[wechat:${liveAccount.accountId}] Processing msg ${msg.localId}: type=${msg.type}, sender=${msg.sender}, isSelf=${msg.isSelf}, content=${(msg.content || "").slice(0, 50)}`,
+    );
+    const pm = await prepareMessage(client, msg, chatId, chat, liveAccount, policy, log);
+    if (pm) {
+      processed.push(pm);
+    }
+  }
+
+  return processed;
 }
 
 /**
@@ -631,69 +675,75 @@ async function dispatchSegment(
       cfg,
       dispatcherOptions: {
         ...prefixOptions,
-        deliver: async (payload: any) => {
-          const mediaList: string[] = payload.mediaUrls?.length
-            ? payload.mediaUrls
-            : payload.mediaUrl
-              ? [payload.mediaUrl]
-              : [];
+        deliver: async (payload: any) =>
+          runSerializedWeChatOperation(
+            liveAccount.accountId,
+            `deliver reply to ${chatId}`,
+            async () => {
+              const mediaList: string[] = payload.mediaUrls?.length
+                ? payload.mediaUrls
+                : payload.mediaUrl
+                  ? [payload.mediaUrl]
+                  : [];
 
-          const tableMode = core.channel.text.resolveMarkdownTableMode({
-            cfg,
-            channel: "wechat",
-            accountId: liveAccount.accountId,
-          });
-          const text = core.channel.text.convertMarkdownTables(
-            payload.text ?? "",
-            tableMode,
-          );
+              const tableMode = core.channel.text.resolveMarkdownTableMode({
+                cfg,
+                channel: "wechat",
+                accountId: liveAccount.accountId,
+              });
+              const text = core.channel.text.convertMarkdownTables(
+                payload.text ?? "",
+                tableMode,
+              );
 
-          if (mediaList.length > 0) {
-            for (const mediaUrl of mediaList) {
-              try {
-                const fsmod = await import("fs/promises");
-                const pathmod = await import("path");
+              if (mediaList.length > 0) {
+                for (const mediaUrl of mediaList) {
+                  try {
+                    const fsmod = await import("fs/promises");
+                    const pathmod = await import("path");
 
-                let base64: string;
-                let mimeType: string;
-                let filename: string;
-                if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
-                  const res = await fetch(mediaUrl);
-                  const buffer = await res.arrayBuffer();
-                  base64 = Buffer.from(buffer).toString("base64");
-                  mimeType = res.headers.get("content-type") ?? "application/octet-stream";
-                  const urlPath = new URL(mediaUrl).pathname;
-                  filename = pathmod.basename(urlPath) || "file";
-                } else {
-                  const buf = await fsmod.readFile(mediaUrl);
-                  base64 = buf.toString("base64");
-                  filename = pathmod.basename(mediaUrl);
-                  const ext = pathmod.extname(mediaUrl).toLowerCase().replace(".", "");
-                  const extMime: Record<string, string> = {
-                    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
-                    gif: "image/gif", webp: "image/webp",
-                  };
-                  mimeType = extMime[ext] ?? "application/octet-stream";
+                    let base64: string;
+                    let mimeType: string;
+                    let filename: string;
+                    if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
+                      const res = await fetch(mediaUrl);
+                      const buffer = await res.arrayBuffer();
+                      base64 = Buffer.from(buffer).toString("base64");
+                      mimeType = res.headers.get("content-type") ?? "application/octet-stream";
+                      const urlPath = new URL(mediaUrl).pathname;
+                      filename = pathmod.basename(urlPath) || "file";
+                    } else {
+                      const buf = await fsmod.readFile(mediaUrl);
+                      base64 = buf.toString("base64");
+                      filename = pathmod.basename(mediaUrl);
+                      const ext = pathmod.extname(mediaUrl).toLowerCase().replace(".", "");
+                      const extMime: Record<string, string> = {
+                        png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+                        gif: "image/gif", webp: "image/webp",
+                      };
+                      mimeType = extMime[ext] ?? "application/octet-stream";
+                    }
+
+                    const isImage = mimeType.startsWith("image/");
+                    if (isImage) {
+                      await client.sendMessage({ chatId, image: { data: base64, mimeType } });
+                    } else {
+                      await client.sendMessage({ chatId, file: { data: base64, filename } });
+                    }
+                  } catch (err) {
+                    log?.error?.(`[wechat:${liveAccount.accountId}] Failed to send media: ${err}`);
+                  }
                 }
-
-                const isImage = mimeType.startsWith("image/");
-                if (isImage) {
-                  await client.sendMessage({ chatId, image: { data: base64, mimeType } });
-                } else {
-                  await client.sendMessage({ chatId, file: { data: base64, filename } });
+                // Send text caption separately if present
+                if (text) {
+                  await client.sendMessage({ chatId, text });
                 }
-              } catch (err) {
-                log?.error?.(`[wechat:${liveAccount.accountId}] Failed to send media: ${err}`);
+              } else if (text) {
+                await client.sendMessage({ chatId, text });
               }
-            }
-            // Send text caption separately if present
-            if (text) {
-              await client.sendMessage({ chatId, text });
-            }
-          } else if (text) {
-            await client.sendMessage({ chatId, text });
-          }
-        },
+            },
+            log,
+          ),
         onError: (err: unknown, info: any) => {
           log?.error?.(
             `[wechat:${liveAccount.accountId}] ${info.kind} reply failed: ${String(err)}`,
@@ -774,19 +824,6 @@ async function processUnreadChat(
     surface: "wechat",
   });
 
-  // Open the chat (triggers media downloads + clear unreads)
-  if (!skipOpen) {
-    log?.info?.(`[wechat:${liveAccount.accountId}] Opening chat ${chatId}...`);
-    try {
-      await client.openChat(chatId, true);
-      log?.info?.(`[wechat:${liveAccount.accountId}] Opened chat ${chatId}`);
-    } catch (err) {
-      log?.error?.(
-        `[wechat:${liveAccount.accountId}] Failed to open chat ${chatId}: ${err}`,
-      );
-    }
-  }
-
   // Determine how many messages to fetch
   const firstPoll = !lastSeenId.has(chatId);
   const prevLastSeen = lastSeenId.get(chatId) ?? 0;
@@ -842,16 +879,36 @@ async function processUnreadChat(
     `[wechat:${liveAccount.accountId}] ${chatId}: ${newMessages.length} new msg(s) to process`,
   );
 
-  // Pre-process all messages (filter, download media, build rawBody)
-  const processed: ProcessedMessage[] = [];
-  for (const msg of newMessages) {
-    log?.info?.(
-      `[wechat:${liveAccount.accountId}] Processing msg ${msg.localId}: type=${msg.type}, sender=${msg.sender}, isSelf=${msg.isSelf}, content=${(msg.content || "").slice(0, 50)}`,
-    );
-    const pm = await prepareMessage(client, msg, chatId, chat, liveAccount, policy, log);
-    if (pm) {
-      processed.push(pm);
-    }
+  const hasNonTextMessages = requiresChatOpenForMessages(newMessages);
+  const processed = hasNonTextMessages
+    ? await runSerializedWeChatOperation(
+        liveAccount.accountId,
+        `prepare non-text messages in ${chatId}`,
+        () =>
+          prepareMessagesForChat(
+            client,
+            newMessages,
+            chatId,
+            chat,
+            liveAccount,
+            policy,
+            !skipOpen,
+            log,
+          ),
+        log,
+      )
+    : await prepareMessagesForChat(
+        client,
+        newMessages,
+        chatId,
+        chat,
+        liveAccount,
+        policy,
+        false,
+        log,
+      );
+  if (!processed) {
+    return;
   }
 
   // Group history catch-up: buffer or inject based on mention status
