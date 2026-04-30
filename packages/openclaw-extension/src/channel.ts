@@ -49,6 +49,7 @@ export const wechatPlugin: ChannelPlugin<ResolvedWeChatAccount> = {
         enabled: { type: "boolean" },
         serverUrl: { type: "string" },
         token: { type: "string" },
+        blockStreaming: { type: "boolean" },
         dmPolicy: {
           type: "string",
           enum: ["open", "allowlist", "disabled"],

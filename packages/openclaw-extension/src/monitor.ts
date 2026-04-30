@@ -3,7 +3,10 @@ import type { Chat, Message, MediaResult, AuthStatus } from "@agent-wechat/share
 import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pipeline";
 import type { ResolvedWeChatAccount } from "./types.js";
 import { getWeChatRuntime } from "./runtime.js";
-import { resolveWeChatAccount } from "./types.js";
+import {
+  resolveWeChatAccount,
+  resolveWeChatDisableBlockStreaming,
+} from "./types.js";
 import {
   normalizeWeChatCommandBody,
   resolveWeChatCommandAuthorization,
@@ -769,6 +772,9 @@ async function dispatchSegment(
       },
       replyOptions: {
         onModelSelected,
+        disableBlockStreaming: resolveWeChatDisableBlockStreaming(
+          liveAccount.blockStreaming,
+        ),
       },
     });
 

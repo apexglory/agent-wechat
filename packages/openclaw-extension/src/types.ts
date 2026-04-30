@@ -12,6 +12,7 @@ export type WeChatConfig = {
   enabled?: boolean;
   serverUrl: string;
   token?: string;
+  blockStreaming?: boolean;
   dmPolicy?: WeChatDmPolicy;
   allowFrom?: string[];
   groupPolicy?: WeChatGroupPolicy;
@@ -26,6 +27,7 @@ export type ResolvedWeChatAccount = {
   enabled: boolean;
   serverUrl: string;
   token?: string;
+  blockStreaming?: boolean;
   dmPolicy: WeChatDmPolicy;
   allowFrom: string[];
   groupPolicy: WeChatGroupPolicy;
@@ -52,6 +54,12 @@ export const DEFAULT_POLL_INTERVAL_MS = 1000;
 export const DEFAULT_AUTH_POLL_INTERVAL_MS = 30_000;
 export const DEFAULT_ACCOUNT_ID = "default";
 
+export function resolveWeChatDisableBlockStreaming(
+  blockStreaming: boolean | undefined,
+): boolean | undefined {
+  return typeof blockStreaming === "boolean" ? !blockStreaming : undefined;
+}
+
 export function resolveWeChatAccount(
   cfg: Record<string, unknown>,
   accountId?: string,
@@ -65,6 +73,10 @@ export function resolveWeChatAccount(
     enabled: wechat.enabled !== false,
     serverUrl: wechat.serverUrl,
     token: wechat.token,
+    blockStreaming:
+      typeof wechat.blockStreaming === "boolean"
+        ? wechat.blockStreaming
+        : undefined,
     dmPolicy: normalizeDmPolicy(wechat.dmPolicy),
     allowFrom: wechat.allowFrom ?? [],
     groupPolicy: normalizeGroupPolicy(wechat.groupPolicy),
