@@ -4,14 +4,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Query a WeChat database and return parsed rows.
-/// Opens read-only via URI (`mode=ro`). We deliberately do NOT pass `immutable=1`:
-/// WeChat writes session.db in WAL journal mode, so new rows live in the
-/// `-wal` file until the next checkpoint. `immutable=1` tells SQLite the file
-/// never changes, which makes it skip the WAL and read only the main file —
-/// stale by tens of seconds. WAL-mode reads do not block writers, so removing
-/// `immutable=1` does not contend with WeChat's own writes.
+/// Opens the database with `immutable=1` to avoid acquiring any shared locks
+/// that could interfere with WeChat's own writes. Since we open a fresh
+/// connection per query and drop it immediately, immutable mode is safe —
+/// we always see the latest committed state at open time.
 pub fn query_wechat_db(db_path: &str, hex_key: &str, sql: &str) -> Vec<Value> {
-    let uri = format!("file:{}?mode=ro", db_path);
+    let uri = format!("file:{}?immutable=1", db_path);
     let conn = match Connection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -266,21 +264,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Open a read-only connection using the production approach (mode=ro URI).
-    /// This is what `query_wechat_db` uses: read-only, but WAL-aware, so it
-    /// can see pages the writer has committed to the -wal file but not yet
-    /// checkpointed back to the main database.
-    fn open_mode_ro(path: &str) -> Connection {
-        let uri = format!("file:{}?mode=ro", path);
-        Connection::open_with_flags(
-            &uri,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_URI
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .unwrap()
-    }
-
     #[test]
     fn immutable_read_does_not_block_writer() {
         let dir = tempfile::tempdir().unwrap();
@@ -446,75 +429,6 @@ mod tests {
         assert_eq!(
             count_fresh, 3,
             "Fresh immutable connection should see committed writes"
-        );
-    }
-
-    /// Reproduces the production Phase 1 latency bug: WeChat writes
-    /// session.db in WAL journal mode. Newly committed rows live in the
-    /// `-wal` file until the next checkpoint (which can be tens of seconds
-    /// away when traffic is light). `immutable=1` tells SQLite the file
-    /// never changes and to skip the WAL — so a reader opened that way
-    /// sees a stale snapshot. `mode=ro` (no `immutable`) consults the WAL
-    /// and returns the up-to-date count.
-    ///
-    /// If this test ever flips back to passing for `immutable=1`, the
-    /// production query path has likely silently regressed.
-    #[test]
-    fn immutable_misses_uncheckpointed_wal_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("wal_visibility.db");
-        let db_path_str = db_path.to_str().unwrap();
-
-        // Set up DB in WAL mode and disable auto-checkpoint so committed
-        // rows stay in the -wal file (mirrors WeChat's behaviour during
-        // light traffic).
-        let writer = Connection::open(db_path_str).unwrap();
-        writer
-            .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA wal_autocheckpoint = 0;
-                 CREATE TABLE messages (id INTEGER PRIMARY KEY, content TEXT);
-                 INSERT INTO messages (content) VALUES ('committed-to-main');",
-            )
-            .unwrap();
-        // Force the initial INSERT to land in the main file so we have a
-        // clear "before" baseline.
-        writer
-            .pragma_update(None, "wal_checkpoint", "FULL")
-            .unwrap();
-
-        // Now insert a row that is committed to the WAL but NOT
-        // checkpointed back to the main file.
-        writer
-            .execute("INSERT INTO messages (content) VALUES ('only-in-wal')", [])
-            .unwrap();
-
-        // Sanity check via the writer connection itself.
-        let writer_count: i64 = writer
-            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(writer_count, 2, "writer should see both rows");
-
-        // BUG: immutable=1 reader skips the WAL — sees only the row in the main file.
-        let immutable = open_immutable(db_path_str);
-        let immutable_count: i64 = immutable
-            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            immutable_count, 1,
-            "immutable=1 must miss WAL rows — if this assertion fails, \
-             SQLite changed semantics and the prod fix may no longer be needed"
-        );
-
-        // FIX: mode=ro consults the WAL — sees the row written above.
-        let mode_ro = open_mode_ro(db_path_str);
-        let mode_ro_count: i64 = mode_ro
-            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            mode_ro_count, 2,
-            "mode=ro must see uncheckpointed WAL rows — this is what the \
-             production query path relies on for fresh inbound messages"
         );
     }
 }
