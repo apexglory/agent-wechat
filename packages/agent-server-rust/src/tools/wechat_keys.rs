@@ -113,10 +113,12 @@ pub fn store_single_key(
 }
 
 /// Verify a single key against a database file.
-/// Opens with immutable=1 to avoid acquiring any locks that could interfere
-/// with WeChat's own writes/checkpoints.
+/// Opens read-only via URI (`mode=ro`). See the matching note on
+/// `query_wechat_db` in `wechat_db.rs`: `immutable=1` would skip WAL,
+/// which can hide pages WeChat hasn't checkpointed yet. WAL reads don't
+/// contend with writers.
 pub fn verify_key(db_path: &str, hex_key: &str) -> bool {
-    let uri = format!("file:{}?immutable=1", db_path);
+    let uri = format!("file:{}?mode=ro", db_path);
     let conn = match Connection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY
