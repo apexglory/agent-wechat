@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+Long-running AT-SPI accessibility dump daemon.
+
+Reuses the same dump logic as a11y-dump but pays the Python startup +
+Atspi.init() cost ONCE per daemon lifetime instead of once per call.
+Reads request lines from stdin, writes a single-line JSON response per
+request to stdout.
+
+Protocol (line-based, one request per line):
+
+  Request:
+    dump [--app NAME] [--max-depth N]
+
+  Response (single line of JSON, terminated by \\n):
+    On success: <json tree>           # tree itself, possibly the literal "null"
+                                       # if --app NAME wasn't found
+    On error:   {"error": "<msg>"}
+
+The daemon shuts down cleanly on EOF (stdin closed by parent).
+"""
+import argparse
+import json
+import shlex
+import sys
+
+try:
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi
+except Exception as exc:
+    # Surface the error on stdout so the supervising process sees it,
+    # then exit non-zero.
+    print(json.dumps({"error": f"failed to import atspi: {exc}"}), flush=True)
+    sys.exit(1)
+
+# One-time AT-SPI bus connection. Reused for every dump request.
+Atspi.init()
+
+
+def get_bounds(node):
+    try:
+        comp = node.get_component_iface()
+        if not comp:
+            return None
+        rect = comp.get_extents(Atspi.CoordType.SCREEN)
+        if rect.width <= 0 or rect.height <= 0:
+            return None
+        return {
+            "x": rect.x,
+            "y": rect.y,
+            "width": rect.width,
+            "height": rect.height,
+        }
+    except Exception:
+        return None
+
+
+def get_states(node):
+    try:
+        state_set = node.get_state_set()
+        if not state_set:
+            return None
+        states = state_set.get_states()
+        if not states:
+            return None
+        state_names = [
+            s.value_name.upper().replace("ATSPI_STATE_", "") for s in states
+        ]
+        useful = [
+            s
+            for s in state_names
+            if s
+            in (
+                "FOCUSED",
+                "SELECTED",
+                "CHECKED",
+                "PRESSED",
+                "EXPANDED",
+                "COLLAPSED",
+                "ACTIVE",
+                "ARMED",
+                "BUSY",
+                "EDITABLE",
+            )
+        ]
+        role = node.get_role_name().replace(" ", "-")
+        interactive_roles = {
+            "push-button",
+            "toggle-button",
+            "check-box",
+            "radio-button",
+            "text",
+            "combo-box",
+            "menu-item",
+            "spin-button",
+        }
+        if role in interactive_roles and "ENABLED" not in state_names:
+            useful.append("DISABLED")
+        return useful if useful else None
+    except Exception:
+        return None
+
+
+def get_window_info(node):
+    info = {}
+    try:
+        pid = node.get_process_id()
+        if pid > 0:
+            info["pid"] = pid
+    except Exception:
+        pass
+    try:
+        info["id"] = node.get_id()
+    except Exception:
+        pass
+    try:
+        attrs = node.get_attributes()
+        if attrs:
+            attr_dict = {}
+            for key in attrs.keys():
+                attr_dict[key] = attrs[key]
+            if attr_dict:
+                info["attributes"] = attr_dict
+    except Exception:
+        pass
+    return info if info else None
+
+
+# Roles whose subtrees we don't need to walk. These contain children
+# (push-buttons, images, labels) that monitor never reads, so skipping
+# them cuts ~50% of DBus IPC round-trips per dump.
+PRUNE_CHILDREN_ROLES = frozenset({
+    "tool-bar",
+    "menu-bar",
+    "menu",
+    "list-item",  # WeChat renders message bubbles as opaque leaves
+    "push-button",
+    "scroll-bar",
+})
+
+
+def find_application(desktop, app_name):
+    try:
+        n = desktop.get_child_count()
+    except Exception:
+        return None
+    for i in range(n):
+        try:
+            child = desktop.get_child_at_index(i)
+        except Exception:
+            continue
+        if not child:
+            continue
+        try:
+            if child.get_role_name() == "application" and child.get_name() == app_name:
+                return child
+        except Exception:
+            continue
+    return None
+
+
+def dump_tree_nested(max_depth=30, app_name=None):
+    desktop = Atspi.get_desktop(0)
+    if app_name:
+        root = find_application(desktop, app_name)
+        if root is None:
+            return None
+    else:
+        root = desktop
+
+    def walk(node, depth=0):
+        if depth > max_depth or not node:
+            return None
+        try:
+            role = node.get_role_name().replace(" ", "-")
+            name = node.get_name() or ""
+            bounds = get_bounds(node)
+            if depth > 1 and bounds is None:
+                return None
+            if role == "label" and not name:
+                return None
+            result = {"role": role, "name": name}
+            if bounds:
+                result["bounds"] = bounds
+            states = get_states(node)
+            if states:
+                result["states"] = states
+            if role == "frame":
+                w = get_window_info(node)
+                if w:
+                    result["window"] = w
+            # Prune: don't descend into known-leaf-for-our-use roles.
+            if role in PRUNE_CHILDREN_ROLES:
+                return result
+            children = []
+            for i in range(node.get_child_count()):
+                child = walk(node.get_child_at_index(i), depth + 1)
+                if child:
+                    children.append(child)
+            if children:
+                result["children"] = children
+            return result
+        except Exception:
+            return None
+
+    return walk(root)
+
+
+def make_parser():
+    p = argparse.ArgumentParser(prog="dump", add_help=False)
+    p.add_argument("cmd", choices=["dump"])
+    p.add_argument("--app", default=None)
+    p.add_argument("--max-depth", type=int, default=30)
+    return p
+
+
+def handle_request(parser, line):
+    parts = shlex.split(line)
+    args = parser.parse_args(parts)
+    tree = dump_tree_nested(max_depth=args.max_depth, app_name=args.app)
+    return json.dumps(tree, ensure_ascii=False, separators=(",", ":"))
+
+
+def main():
+    parser = make_parser()
+    out = sys.stdout
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            resp = handle_request(parser, line)
+        except SystemExit:
+            resp = json.dumps({"error": f"bad request: {line!r}"})
+        except Exception as e:
+            resp = json.dumps({"error": f"{type(e).__name__}: {e}"})
+        out.write(resp)
+        out.write("\n")
+        out.flush()
+
+
+if __name__ == "__main__":
+    main()
