@@ -12,6 +12,38 @@ import type {
   SendParams,
 } from "./types/index.js";
 
+// A11y fast-path state shape (matches Rust router/wechat_a11y.rs)
+export type A11yBounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+export type ChatUnreadEntry = {
+  name: string;
+  unread: number;
+  mediaTags: string[];
+  preview: string;
+  time?: string;
+  bounds?: A11yBounds;
+  open: boolean;
+};
+
+export type A11yMessageEntry = {
+  name: string;
+  bounds?: A11yBounds;
+};
+
+export type A11yState = {
+  openFrames: string[];
+  chatsWithUnread: ChatUnreadEntry[];
+  messagesPerFrame: Record<string, A11yMessageEntry[]>;
+  opened: string[];
+  openErrors?: Array<{ chat: string; exitCode: number; stderr: string }>;
+  error?: string;
+};
+
 // Re-export Status/LoginState types used by the client
 export type LoginState = { status: string };
 export type StatusResponse = {
@@ -228,6 +260,43 @@ export class WeChatClient {
     format: "json" | "aria",
   ): Promise<{ tree: unknown; aria: string | null; error?: string }> {
     return this.get(`/api/debug/a11y${qs({ format })}`);
+  }
+
+  /**
+   * Fast-path WeChat state via a11y tree (no DB query).
+   * Returns open chat windows, chats with unread badges in the main window,
+   * and the latest messages list-item names for each open chat frame.
+   *
+   * If `autoOpen` is true, any chat with an unread badge but no top-level
+   * frame is double-clicked to spawn an independent window.
+   */
+  async wechatA11yState(opts?: {
+    autoOpen?: boolean;
+    includeMessages?: boolean;
+  }): Promise<A11yState> {
+    return this.get(
+      `/api/wechat/a11y_state${qs({
+        autoOpen: opts?.autoOpen,
+        includeMessages: opts?.includeMessages,
+      })}`,
+    );
+  }
+
+  /**
+   * Fast-path text send: types into the chat's independent X11 window
+   * (skipping `chat-select`/`send_message` plan). `frameName` is the
+   * a11y frame display name, which on this WeChat build matches the
+   * chat's display name (e.g. `Chat.name`).
+   *
+   * Returns `{ok: false, error}` when the frame isn't visible, the input
+   * box can't be located, or any xdotool step fails — callers should
+   * fall back to `sendMessage(...)`.
+   */
+  async sendFast(params: {
+    frameName: string;
+    text: string;
+  }): Promise<{ ok: boolean; error?: string; windowId?: string }> {
+    return this.post("/api/messages/send-fast", params);
   }
 
   // ---- Sessions ----

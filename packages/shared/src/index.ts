@@ -7,6 +7,10 @@ export {
   type WeChatClientOptions,
   type StatusResponse,
   type AuthStatus,
+  type A11yState,
+  type ChatUnreadEntry,
+  type A11yMessageEntry,
+  type A11yBounds,
 } from "./client.js";
 
 // Export schemas (but not the inferred types which duplicate types/)

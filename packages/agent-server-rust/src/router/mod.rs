@@ -7,6 +7,7 @@ mod messages;
 mod sessions;
 mod status;
 mod vnc;
+mod wechat_a11y;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -40,6 +41,8 @@ pub fn build_router() -> Router {
         .route("/api/chats/{id}", get(chats::get_chat))
         .route("/api/chats/find", get(chats::find_chats))
         .route("/api/chats/{id}/open", post(chats::open_chat))
+        // WeChat a11y fast-path state
+        .route("/api/wechat/a11y_state", get(wechat_a11y::a11y_state))
         // Contacts
         .route("/api/contacts", get(contacts::list_contacts))
         .route("/api/contacts/find", get(contacts::find_contacts))
@@ -50,6 +53,7 @@ pub fn build_router() -> Router {
             get(messages::get_media),
         )
         .route("/api/messages/send", post(messages::send_message))
+        .route("/api/messages/send-fast", post(messages::send_fast))
         .route(
             "/api/messages/{chat_id}/transfer/receive",
             post(messages::receive_transfer),

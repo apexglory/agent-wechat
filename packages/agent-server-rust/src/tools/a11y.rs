@@ -32,6 +32,62 @@ pub async fn get_a11y_desktop(options: &ExecOptions) -> Result<A11yNode, String>
     Ok(tree)
 }
 
+/// Get a single top-level application's accessibility subtree.
+///
+/// Tries the long-running a11y daemon first (~0.3-0.5s); falls back to
+/// one-shot `python3 a11y-dump` (~1.2s) if the daemon is unreachable.
+/// Returns an error if the application isn't found in the tree.
+pub async fn get_a11y_app(app_name: &str, options: &ExecOptions) -> Result<A11yNode, String> {
+    // ---- Fast path: long-running daemon ----
+    match super::a11y_daemon::dump_via_daemon(Some(app_name), 30, options).await {
+        Ok(line) => {
+            if line.trim() == "null" {
+                return Err(format!("application '{app_name}' not found in a11y tree"));
+            }
+            // The daemon may also surface an explicit {"error": "..."} payload.
+            if line.starts_with("{\"error\"") {
+                tracing::warn!("[a11y] daemon reported error: {line}");
+            } else {
+                match serde_json::from_str::<A11yNode>(&line) {
+                    Ok(mut tree) => {
+                        add_parent_refs(&mut tree, None);
+                        return Ok(tree);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[a11y] daemon response parse failed, falling back: {e}"
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("[a11y] daemon unavailable, falling back: {e}");
+        }
+    }
+
+    // ---- Fallback: one-shot exec_command (preserves old behaviour) ----
+    let result = exec_command(
+        "python3",
+        &[A11Y_SCRIPT_PATH, "--format", "json", "--app", app_name],
+        options,
+    )
+    .await;
+
+    if result.exit_code != 0 {
+        return Err(result.stderr.clone().or_if_empty(&result.stdout));
+    }
+    if result.stdout.trim() == "null" {
+        return Err(format!("application '{app_name}' not found in a11y tree"));
+    }
+
+    let mut tree: A11yNode =
+        serde_json::from_str(&result.stdout).map_err(|e| format!("Failed to parse a11y: {e}"))?;
+
+    add_parent_refs(&mut tree, None);
+    Ok(tree)
+}
+
 /// Get a11y tree as ARIA-style text.
 pub async fn get_a11y_aria(options: &ExecOptions) -> Result<String, String> {
     let result = exec_command("python3", &[A11Y_SCRIPT_PATH, "--format", "aria"], options).await;

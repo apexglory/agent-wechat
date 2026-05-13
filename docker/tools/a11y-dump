@@ -6,6 +6,7 @@ Usage:
   a11y-dump                    # JSON nested tree (default)
   a11y-dump --format json      # JSON nested tree
   a11y-dump --format aria      # ARIA-style human-readable
+  a11y-dump --app wechat       # only dump the named application subtree
 
 Output formats:
   json: Nested tree with children arrays, compatible with CSS selectors
@@ -108,10 +109,37 @@ def get_window_info(node):
     return info if info else None
 
 
-def dump_tree_nested(max_depth=30):
-    """Dump desktop as nested JSON tree with children arrays."""
+def find_application(desktop, app_name):
+    """Find a direct application child of the desktop by name."""
+    try:
+        n = desktop.get_child_count()
+    except Exception:
+        return None
+    for i in range(n):
+        try:
+            child = desktop.get_child_at_index(i)
+        except Exception:
+            continue
+        if not child:
+            continue
+        try:
+            if child.get_role_name() == "application" and child.get_name() == app_name:
+                return child
+        except Exception:
+            continue
+    return None
+
+
+def dump_tree_nested(max_depth=30, app_name=None):
+    """Dump desktop (or a single application subtree) as nested JSON tree."""
     Atspi.init()
     desktop = Atspi.get_desktop(0)
+    if app_name:
+        root = find_application(desktop, app_name)
+        if root is None:
+            return None
+    else:
+        root = desktop
 
     def walk(node, depth=0):
         if depth > max_depth or not node:
@@ -162,13 +190,19 @@ def dump_tree_nested(max_depth=30):
         except Exception:
             return None
 
-    return walk(desktop)
+    return walk(root)
 
 
-def dump_tree_aria(max_depth=30):
-    """Dump desktop as ARIA-style indented tree."""
+def dump_tree_aria(max_depth=30, app_name=None):
+    """Dump desktop (or a single application subtree) as ARIA-style text."""
     Atspi.init()
     desktop = Atspi.get_desktop(0)
+    if app_name:
+        root = find_application(desktop, app_name)
+        if root is None:
+            return ""
+    else:
+        root = desktop
     lines = []
 
     def format_bounds(bounds):
@@ -209,7 +243,7 @@ def dump_tree_aria(max_depth=30):
         except Exception:
             return
 
-    walk(desktop)
+    walk(root)
     return "\n".join(lines)
 
 
@@ -229,12 +263,17 @@ def main():
         default=30,
         help="Maximum tree depth (default: 30)"
     )
+    parser.add_argument(
+        "--app",
+        default=None,
+        help="Only dump the named top-level application subtree (e.g. 'wechat')"
+    )
     args = parser.parse_args()
 
     if args.format == "aria":
-        print(dump_tree_aria(args.max_depth))
+        print(dump_tree_aria(args.max_depth, app_name=args.app))
     else:
-        tree = dump_tree_nested(args.max_depth)
+        tree = dump_tree_nested(args.max_depth, app_name=args.app)
         print(json.dumps(tree, ensure_ascii=False))
 
 

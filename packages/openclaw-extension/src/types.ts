@@ -50,7 +50,10 @@ function normalizeGroupPolicy(policy: unknown): WeChatGroupPolicy {
 }
 
 // Defaults
-export const DEFAULT_POLL_INTERVAL_MS = 1000;
+// 500ms keeps the monitor loop responsive without spinning the a11y dump
+// (which currently takes ~500-1000ms). With a 500ms tail-sleep, full
+// cycle time = dump + tail ≈ 1-1.5s and detection latency ≈ cycle/2.
+export const DEFAULT_POLL_INTERVAL_MS = 500;
 export const DEFAULT_AUTH_POLL_INTERVAL_MS = 30_000;
 export const DEFAULT_ACCOUNT_ID = "default";
 

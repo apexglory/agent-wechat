@@ -100,7 +100,7 @@ export const wechatPlugin: ChannelPlugin<ResolvedWeChatAccount> = {
           groupPolicy: "disabled",
           groupAllowFrom: [],
           groups: {},
-          pollIntervalMs: 1000,
+          pollIntervalMs: 500,
           authPollIntervalMs: 30000,
         };
       }

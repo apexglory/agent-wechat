@@ -16,6 +16,8 @@ use crate::ia::types::{
 use crate::plans::receive_transfer::{ReceiveTransferParams, ReceiveTransferPlan};
 use crate::plans::send_message::{SendMessageParams, SendMessagePlan};
 use crate::sessions::manager::get_session;
+use crate::tools::exec::ExecOptions;
+use crate::tools::frame_send;
 use crate::tools::wechat_db::{find_wechat_pid, list_account_dbs};
 use crate::tools::wechat_keys::{extract_keys_async, get_image_keys, get_stored_keys, store_keys};
 use crate::tools::wechat_media::get_message_media;
@@ -173,6 +175,44 @@ pub struct ImageInput {
 pub struct FileInput {
     data: String,
     filename: String,
+}
+
+// ============================================================
+// Fast-path text send: skip chat-select and operate directly on
+// the chat's independent X11 window. Falls back to send_message
+// (caller responsibility) if `ok=false` is returned.
+// ============================================================
+#[derive(Deserialize)]
+pub struct SendFastParams {
+    #[serde(rename = "frameName")]
+    pub frame_name: String,
+    pub text: String,
+}
+
+pub async fn send_fast(Json(input): Json<SendFastParams>) -> Json<serde_json::Value> {
+    let session = get_session("default");
+    let exec_opts = ExecOptions {
+        session: session.map(|s| s.clone()),
+        timeout_ms: 10_000,
+    };
+    let r = frame_send::send_to_frame(&input.frame_name, &input.text, &exec_opts).await;
+    let mut obj = serde_json::Map::new();
+    obj.insert("ok".into(), serde_json::Value::Bool(r.ok));
+    if let Some(e) = r.error {
+        obj.insert("error".into(), serde_json::Value::String(e));
+    }
+    if let Some(w) = r.window_id {
+        obj.insert("windowId".into(), serde_json::Value::String(w));
+    }
+    if let Some(b) = r.input_bounds {
+        obj.insert(
+            "inputBounds".into(),
+            serde_json::json!({
+                "x": b.x, "y": b.y, "width": b.width, "height": b.height,
+            }),
+        );
+    }
+    Json(serde_json::Value::Object(obj))
 }
 
 pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {

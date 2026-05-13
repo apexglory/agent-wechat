@@ -1,6 +1,8 @@
 pub mod a11y;
+pub mod a11y_daemon;
 pub mod chat_select;
 pub mod exec;
+pub mod frame_send;
 pub mod qr;
 pub mod screenshot;
 pub mod wechat_chats;

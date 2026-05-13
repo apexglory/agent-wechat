@@ -13,7 +13,18 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 /// Only one plan can run at a time — they all drive the GUI.
+///
+/// Also held by short-lived xdotool sequences (e.g. frame-aware send) so they
+/// don't fight a plan for keyboard/mouse focus. Always acquire via
+/// `acquire_plan_lock()` so future per-chat sharding stays in one place.
 static PLAN_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Public accessor for the global plan/UI lock. Callers (e.g. fast-path send)
+/// should hold this for the duration of any xdotool sequence that touches
+/// global keyboard/mouse focus.
+pub async fn acquire_plan_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    PLAN_LOCK.lock().await
+}
 
 pub struct ExecutionResult {
     pub success: bool,

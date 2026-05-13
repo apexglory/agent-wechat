@@ -1,5 +1,5 @@
 import { WeChatClient } from "@agent-wechat/shared";
-import type { Chat, Message, MediaResult, AuthStatus } from "@agent-wechat/shared";
+import type { Chat, Message, MediaResult, AuthStatus, A11yState } from "@agent-wechat/shared";
 import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pipeline";
 import type { ResolvedWeChatAccount } from "./types.js";
 import { getWeChatRuntime } from "./runtime.js";
@@ -24,6 +24,59 @@ import { formatPaymentBody } from "./payment-format.js";
 
 // Message types that may have downloadable media
 const MEDIA_TYPES = new Set([3, 34, 43]); // image, voice, video
+
+// ============================================================
+// A11y fast-path state (module-level, shared across accounts)
+//
+// Detects inbound DM text messages via the a11y tree ~7-9s before
+// WCDB flushes SessionTable. The trailing `unreadCount` items of
+// each open chat frame (sorted by bounds.y) are treated as new;
+// dedup ringbuffers prevent re-dispatch and DB-path double-processing.
+// Media / transfer / red-packet still fall back to the DB path.
+// ============================================================
+type RecentEntry = { text: string; ts: number };
+const A11Y_DEDUP_WINDOW_MS = 120_000; // 2 min
+
+const recentlySentReplies = new Map<string, RecentEntry[]>();   // wxid -> outbound texts (dedup bot's own)
+const a11yDispatchedContent = new Map<string, RecentEntry[]>(); // wxid -> contents already dispatched via a11y
+
+// Unique negative localId per a11y-dispatched message, so openclaw's
+// inbound MessageSid dedup (wechat:<chat>:<localId>) doesn't collapse
+// every a11y message into one. Real WeChat localIds are positive.
+let a11yLocalIdCounter = -1;
+function nextA11yLocalId(): number {
+  const id = a11yLocalIdCounter;
+  a11yLocalIdCounter -= 1;
+  // Wrap if it ever gets near Number.MIN_SAFE_INTEGER (never realistic)
+  if (a11yLocalIdCounter < -1_000_000_000) a11yLocalIdCounter = -1;
+  return id;
+}
+
+const A11Y_TIMESTAMP_ROW_RE = /^\d{1,2}:\d{2}(?::\d{2})?$/;
+const A11Y_MEDIA_TAG_RE = /\[(?:Image|Audio|Video|File|Transfer|Red\s*packet)/i;
+const A11Y_AUDIO_NAME_RE = /^Audio\d+/i;
+
+function cleanupRecent(map: Map<string, RecentEntry[]>): void {
+  const cutoff = Date.now() - A11Y_DEDUP_WINDOW_MS;
+  for (const [k, arr] of map.entries()) {
+    const fresh = arr.filter((e) => e.ts >= cutoff);
+    if (fresh.length === 0) map.delete(k);
+    else map.set(k, fresh);
+  }
+}
+
+function recordRecent(map: Map<string, RecentEntry[]>, key: string, text: string): void {
+  const arr = map.get(key) ?? [];
+  arr.push({ text, ts: Date.now() });
+  map.set(key, arr);
+}
+
+function recentContains(map: Map<string, RecentEntry[]>, key: string, text: string): boolean {
+  const arr = map.get(key);
+  if (!arr) return false;
+  const cutoff = Date.now() - A11Y_DEDUP_WINDOW_MS;
+  return arr.some((e) => e.ts >= cutoff && e.text === text);
+}
 
 // History context markers (match openclaw's built-in markers)
 const HISTORY_CONTEXT_MARKER = "[Chat messages since your last reply - for context]";
@@ -51,6 +104,117 @@ type ProcessedMessage = {
   hasMedia: boolean;
   isMentioned: boolean;
 };
+
+/**
+ * A11y fast-path: dispatch a single DM text message constructed from
+ * the a11y tree (no DB query, no chat-select). Reuses dispatchSegment
+ * by building a stub Message with localId=-1 — the DB path will see
+ * the real message ~9s later and skip it via a11yDispatchedContent dedup.
+ */
+async function dispatchA11yTextMessage(
+  client: WeChatClient,
+  account: ResolvedWeChatAccount,
+  cfg: any,
+  chat: Chat,
+  content: string,
+  log?: { info?: (...args: any[]) => void; error?: (...args: any[]) => void },
+): Promise<void> {
+  const core = getWeChatRuntime();
+  const chatId = chat.username ?? chat.id;
+  const liveAccount = resolveWeChatAccount(cfg as Record<string, unknown>, account.accountId) ?? account;
+  const storeAllowFrom = await core.channel.pairing
+    .readAllowFromStore({ channel: "wechat", accountId: liveAccount.accountId, env: process.env })
+    .catch(() => [] as string[]);
+  const policy = resolveWeChatPolicyContext({
+    account: liveAccount,
+    cfg: cfg as any,
+    chatId,
+    storeAllowFrom,
+  });
+  const allowTextCommands = core.channel.commands.shouldHandleTextCommands({
+    cfg,
+    surface: "wechat",
+  });
+
+  const access = resolveWeChatInboundAccessDecision({
+    isGroup: false,
+    senderId: chatId,
+    policy,
+  });
+  if (!access.allowed) {
+    log?.info?.(
+      `[wechat:${liveAccount.accountId}] a11y fast-path: blocked by policy (${access.reason}) for ${chatId}`,
+    );
+    return;
+  }
+
+  const now = Date.now();
+  const localId = nextA11yLocalId();
+  const stubMsg: Message = {
+    localId,
+    serverId: localId,
+    chatId,
+    sender: chatId,
+    senderName: chat.name,
+    type: 1,
+    kind: "text",
+    content,
+    timestamp: new Date(now).toISOString(),
+    isSelf: false,
+  };
+  const pm: ProcessedMessage = {
+    msg: stubMsg,
+    rawBody: content,
+    commandBody: normalizeWeChatCommandBody(content, { isGroup: false, wasMentioned: false }),
+    senderName: chat.name,
+    senderId: chatId,
+    isGroup: false,
+    timestamp: now,
+    hasMedia: false,
+    isMentioned: false,
+  };
+
+  await dispatchSegment(
+    [pm],
+    client,
+    chatId,
+    chat,
+    liveAccount,
+    policy,
+    storeAllowFrom,
+    allowTextCommands,
+    cfg,
+    log,
+    undefined,
+  );
+}
+
+/**
+ * Try the frame-aware fast send first (skips chat-select / send_message plan).
+ * Falls back to the existing `sendMessage` HTTP route on any failure.
+ * DM only for phase 1 — groups don't get standalone frames by display name.
+ */
+async function sendTextWithFastFallback(
+  client: WeChatClient,
+  chat: Chat,
+  chatId: string,
+  text: string,
+  log?: { info?: (...args: any[]) => void; error?: (...args: any[]) => void },
+): Promise<void> {
+  const isGroup = chatId.includes("@chatroom");
+  if (!isGroup && chat.name) {
+    try {
+      const fast = await client.sendFast({ frameName: chat.name, text });
+      if (fast.ok) return;
+      log?.info?.(
+        `[wechat] sendFast skipped, falling back to sendMessage: ${fast.error ?? "unknown"}`,
+      );
+    } catch (err) {
+      log?.info?.(`[wechat] sendFast threw, falling back: ${err}`);
+    }
+  }
+  await client.sendMessage({ chatId, text });
+}
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -187,6 +351,34 @@ export async function startWeChatMonitor(
         }
       }
 
+      // ---- A11y fast-path probe ----
+      // Triggers auto-double-click on any chat that has an unread badge in
+      // the main window but no independent frame yet, then (for already-open
+      // chats) reads new messages directly from the a11y tree — typically
+      // ~9s ahead of WCDB's batched SessionTable flush.
+      let a11yState: A11yState | null = null;
+      const a11yT0 = Date.now();
+      try {
+        a11yState = await client.wechatA11yState({
+          autoOpen: true,
+          includeMessages: true,
+        });
+        if (a11yState.error) {
+          log?.info?.(
+            `[wechat:${account.accountId}] a11y_state error: ${a11yState.error} (${Date.now() - a11yT0}ms)`,
+          );
+          a11yState = null;
+        } else if (a11yState.opened.length > 0) {
+          log?.info?.(
+            `[wechat:${account.accountId}] a11y auto-opened ${a11yState.opened.length} chat window(s): ${a11yState.opened.join(", ")}`,
+          );
+        }
+      } catch (err) {
+        log?.info?.(
+          `[wechat:${account.accountId}] a11y_state failed: ${err} (${Date.now() - a11yT0}ms)`,
+        );
+      }
+
       // ---- Message polling ----
       let chats: Chat[];
       try {
@@ -199,18 +391,116 @@ export async function startWeChatMonitor(
         continue;
       }
 
-      // Filter to chats with unreads (skip system / service accounts)
+      // ---- A11y fast-path dispatch (DM text only, phase 1) ----
+      // For each chat that has an unread badge AND an open independent window,
+      // diff the messages list-items vs the last seen set. Newly-arrived
+      // plain-text items get dispatched immediately — bypassing SessionTable's
+      // ~9s flush lag. The eventual DB-path processUnreadChat will see these
+      // same messages later and skip them via a11yDispatchedContent dedup in
+      // prepareMessage.
+      if (a11yState && a11yState.chatsWithUnread.length > 0) {
+        // Map a11y display name → Chat. Build TWO sets: dispatchable
+        // (DM, non-ignored) and ignoredNames (so we can silently skip
+        // official accounts / system chats / groups without log spam).
+        const nameToChat = new Map<string, Chat>();
+        const ignoredNames = new Set<string>();
+        for (const c of chats) {
+          const wxid = c.username ?? c.id;
+          if (!wxid) continue;
+          if (!c.name) continue;
+          if (wxid.includes("@chatroom") || isAutomationIgnoredChatId(wxid)) {
+            ignoredNames.add(c.name);
+            continue;
+          }
+          nameToChat.set(c.name, c);
+        }
+
+        for (const unreadChat of a11yState.chatsWithUnread) {
+          if (abortSignal.aborted) break;
+          if (ignoredNames.has(unreadChat.name)) continue; // silent: group/official/system
+          if (!unreadChat.open) {
+            log?.info?.(
+              `[wechat:${account.accountId}] a11y fast-path skip ${unreadChat.name}: window not open`,
+            );
+            continue;
+          }
+          const chat = nameToChat.get(unreadChat.name);
+          if (!chat) {
+            // Likely a chat that hasn't been written to SessionTable yet
+            // (so listChats can't resolve its wxid). Quiet: this is expected
+            // when WCDB hasn't flushed; the DB path will handle it later.
+            continue;
+          }
+          const wxid = chat.username ?? chat.id;
+          const items = a11yState.messagesPerFrame[unreadChat.name];
+          if (!items || items.length === 0) continue; // no messages list yet
+
+          // Sort by bounds.y ascending → visual top-to-bottom (oldest first, newest last).
+          // Then take the trailing `unread` non-timestamp items as the candidates —
+          // this is the authoritative signal from the main-window unread badge.
+          const ordered = [...items]
+            .map((it) => ({ raw: it.name, y: it.bounds?.y ?? 0 }))
+            .sort((a, b) => a.y - b.y);
+          const nonTs = ordered.filter(
+            (it) => !A11Y_TIMESTAMP_ROW_RE.test(it.raw.trim()),
+          );
+          const candidates = nonTs.slice(-unreadChat.unread);
+          if (candidates.length === 0) continue;
+
+          for (const item of candidates) {
+            const trimmed = item.raw.replace(/\n\s*$/, "").trim();
+            if (trimmed.length === 0) continue;
+            // Phase 1: skip media / transfer / red-packet / voice — DB path handles these
+            if (A11Y_MEDIA_TAG_RE.test(trimmed)) continue;
+            if (A11Y_AUDIO_NAME_RE.test(trimmed)) continue;
+            if (trimmed.startsWith("Image") && trimmed.length < 20) continue;
+            if (trimmed.startsWith("[Red packet")) continue;
+            if (trimmed.startsWith("￥")) continue;
+            // Bot's own outbound reply, echoed back in the messages list
+            if (recentContains(recentlySentReplies, wxid, trimmed)) continue;
+            // Already dispatched in a prior a11y poll
+            if (recentContains(a11yDispatchedContent, wxid, trimmed)) continue;
+
+            recordRecent(a11yDispatchedContent, wxid, trimmed);
+            log?.info?.(
+              `[wechat:${account.accountId}] a11y fast-path dispatching to ${unreadChat.name} (unread=${unreadChat.unread}): ${trimmed.slice(0, 60)}`,
+            );
+            try {
+              await dispatchA11yTextMessage(client, account, cfg, chat, trimmed, log);
+            } catch (err) {
+              log?.error?.(
+                `[wechat:${account.accountId}] a11y fast-path dispatch failed: ${err}`,
+              );
+            }
+          }
+        }
+
+        cleanupRecent(recentlySentReplies);
+        cleanupRecent(a11yDispatchedContent);
+      }
+
+      // Filter to chats with unreads (skip system / service accounts).
+      // Further drop chats whose lastMsgLocalId is already <= lastSeenId —
+      // those are stuck-on-screen unread badges (e.g. when bot answers
+      // NO_REPLY: WeChat still shows unread but we've already processed
+      // / deduped the message). Logging them every tick spams the log.
       const unreadChats = chats.filter(
         (c) => c.unreadCount > 0 && !isAutomationIgnoredChatId(c.username ?? c.id),
       );
-      if (unreadChats.length > 0) {
+      const actionableUnreadChats = unreadChats.filter((c) => {
+        const prevSeen = lastSeenId.get(c.username ?? c.id);
+        if (prevSeen === undefined) return true;
+        if (!c.lastMsgLocalId) return true;
+        return c.lastMsgLocalId > prevSeen;
+      });
+      if (actionableUnreadChats.length > 0) {
         log?.info?.(
-          `[wechat:${account.accountId}] ${unreadChats.length} chat(s) with unreads`,
+          `[wechat:${account.accountId}] ${actionableUnreadChats.length} chat(s) with unreads`,
         );
       }
 
-      if (unreadChats.length > 0) {
-        for (const chat of unreadChats) {
+      if (actionableUnreadChats.length > 0) {
+        for (const chat of actionableUnreadChats) {
           if (abortSignal.aborted) break;
           const chatId = chat.username ?? chat.id;
           const prevSeen = lastSeenId.get(chatId);
@@ -280,6 +570,16 @@ async function prepareMessage(
   if (msg.isSelf) {
     log?.info?.(`[wechat:${liveAccount.accountId}] Skipping self-sent msg ${msg.localId}`);
     return null;
+  }
+
+  // Skip if already dispatched via a11y fast path (DM text dedup)
+  if (msg.kind === "text" && msg.content) {
+    if (recentContains(a11yDispatchedContent, chatId, msg.content)) {
+      log?.info?.(
+        `[wechat:${liveAccount.accountId}] Skipping msg ${msg.localId} — already dispatched via a11y fast path`,
+      );
+      return null;
+    }
   }
 
   const isGroup = chatId.includes("@chatroom");
@@ -756,10 +1056,12 @@ async function dispatchSegment(
                 }
                 // Send text caption separately if present
                 if (text) {
-                  await client.sendMessage({ chatId, text });
+                  await sendTextWithFastFallback(client, chat, chatId, text, log);
+                  recordRecent(recentlySentReplies, chatId, text);
                 }
               } else if (text) {
-                await client.sendMessage({ chatId, text });
+                await sendTextWithFastFallback(client, chat, chatId, text, log);
+                recordRecent(recentlySentReplies, chatId, text);
               }
             },
             log,
