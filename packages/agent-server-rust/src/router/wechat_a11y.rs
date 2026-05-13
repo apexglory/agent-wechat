@@ -56,7 +56,7 @@ pub async fn a11y_state(Query(params): Query<A11yStateParams>) -> Json<Value> {
     let wechat_app =
         find_first(&tree, &|n: &A11yNode| n.role == "application" && n.name == "wechat");
 
-    let open_frames: Vec<String> = wechat_app
+    let mut open_frames: Vec<String> = wechat_app
         .map(collect_top_level_frames)
         .unwrap_or_default();
 
@@ -183,6 +183,72 @@ pub async fn a11y_state(Query(params): Query<A11yStateParams>) -> Json<Value> {
                 "exitCode": res.exit_code,
                 "stderr": res.stderr,
             }));
+        }
+    }
+
+    // If we just auto-opened any chat, the pre-open snapshot still says the
+    // frame isn't open and the new window's messages aren't in the tree.
+    // The unread badge from the pre-open snapshot is the only signal the
+    // caller has — WeChat clears it the moment the window opens, so by the
+    // next poll there's nothing to trigger on. Re-dump and patch in:
+    //   * the now-visible frame name (so chatsWithUnread[*].open flips true)
+    //   * the messagesPerFrame entry for each newly-opened frame
+    // Pre-open chatsWithUnread is preserved as-is (the badge count from S1
+    // is what the caller needs to slice the message list).
+    if !opened.is_empty() {
+        // Small wait for WeChat to render the spawned window before re-dumping
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Ok(tree2) = get_a11y_app("wechat", &ExecOptions::default()).await {
+            let wechat_app2 = find_first(
+                &tree2,
+                &|n: &A11yNode| n.role == "application" && n.name == "wechat",
+            );
+            let new_frames = wechat_app2
+                .map(collect_top_level_frames)
+                .unwrap_or_default();
+
+            for chat in chats_with_unread.iter_mut() {
+                if !chat.open && new_frames.iter().any(|f| f == &chat.name) {
+                    chat.open = true;
+                }
+            }
+
+            if params.include_messages {
+                if let Some(app) = wechat_app2 {
+                    if let Some(frames) = &app.children {
+                        for fr in frames {
+                            if fr.role != "frame"
+                                || fr.name.is_empty()
+                                || fr.name == "Weixin"
+                            {
+                                continue;
+                            }
+                            if !opened.contains(&fr.name) {
+                                continue;
+                            }
+                            if let Some(msg_list) = find_first(fr, &|n: &A11yNode| {
+                                n.role == "list" && n.name == "Messages"
+                            }) {
+                                if let Some(items) = &msg_list.children {
+                                    let arr: Vec<Value> = items
+                                        .iter()
+                                        .map(|m| {
+                                            json!({
+                                                "name": m.name,
+                                                "bounds": m.bounds,
+                                            })
+                                        })
+                                        .collect();
+                                    messages_per_frame
+                                        .insert(fr.name.clone(), Value::Array(arr));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            open_frames = new_frames;
         }
     }
 

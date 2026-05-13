@@ -2,19 +2,28 @@
 set -euo pipefail
 
 # Compile the Rust server inside Docker and deploy into a running container.
+# Also syncs docker/tools/* into the container's /opt/tools so changes to the
+# Python helper scripts (a11y-dump, a11y-dumpd, chat-select, …) land without
+# needing a full image rebuild. Use --skip-tools to opt out.
+#
 # Builds in debug mode by default (for debugging). Use --release for optimized builds.
 # Usage:
-#   ./scripts/dev-deploy.sh                 # debug build (default)
+#   ./scripts/dev-deploy.sh                 # debug build (default), syncs tools
 #   ./scripts/dev-deploy.sh --release       # release build
 #   ./scripts/dev-deploy.sh --container abc # specify container name/id
+#   ./scripts/dev-deploy.sh --skip-tools    # only deploy the binary
+#   ./scripts/dev-deploy.sh --tools-only    # only sync docker/tools (no rebuild)
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RUST_DIR="$ROOT_DIR/packages/agent-server-rust"
+TOOLS_DIR="$ROOT_DIR/docker/tools"
 BUILDER_IMAGE="rust:1.93-bookworm"
 CACHE_VOLUME="agent-wechat-cargo-cache"
 
 CONTAINER=""
 BUILD_MODE="debug"
+SYNC_TOOLS=1
+BUILD_BINARY=1
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -26,9 +35,17 @@ while [ "$#" -gt 0 ]; do
       BUILD_MODE="release"
       shift
       ;;
+    --skip-tools)
+      SYNC_TOOLS=0
+      shift
+      ;;
+    --tools-only)
+      BUILD_BINARY=0
+      shift
+      ;;
     *)
       echo "unknown argument: $1" >&2
-      echo "Usage: $0 [--container name] [--release]" >&2
+      echo "Usage: $0 [--container name] [--release] [--skip-tools] [--tools-only]" >&2
       exit 1
       ;;
   esac
@@ -83,26 +100,52 @@ if [ -f "$HOME/.cargo/config.toml" ]; then
   DOCKER_RUN_ARGS+=(-v "$HOME/.cargo/config.toml:/usr/local/cargo/config.toml:ro")
 fi
 
-echo "==> Building in Docker ($PLATFORM, mode=$BUILD_MODE)"
-docker run "${DOCKER_RUN_ARGS[@]}" \
-  "$BUILDER_IMAGE" \
-  cargo build $CARGO_ARGS
+if [ "$BUILD_BINARY" = 1 ]; then
+  echo "==> Building in Docker ($PLATFORM, mode=$BUILD_MODE)"
+  docker run "${DOCKER_RUN_ARGS[@]}" \
+    "$BUILDER_IMAGE" \
+    cargo build $CARGO_ARGS
 
-echo "==> Deploying to container: $CONTAINER"
-# Extract binary from cache volume via a temporary container
-TMP_CT=$(docker create -v "$CACHE_VOLUME:/target:ro" "$BUILDER_IMAGE")
-docker cp "$TMP_CT:/target/$BINARY_DIR/agent-server" - | docker cp - "$CONTAINER:/opt/agent-server/"
+  echo "==> Deploying binary to container: $CONTAINER"
+  # Extract binary from cache volume via a temporary container
+  TMP_CT=$(docker create -v "$CACHE_VOLUME:/target:ro" "$BUILDER_IMAGE")
+  docker cp "$TMP_CT:/target/$BINARY_DIR/agent-server" - | docker cp - "$CONTAINER:/opt/agent-server/"
 
-# For debug builds, also extract binary locally for symbol resolution
-if [ "$BUILD_MODE" = "debug" ]; then
-  LOCAL_BIN="$RUST_DIR/target/debug-remote"
-  mkdir -p "$LOCAL_BIN"
-  docker cp "$TMP_CT:/target/$BINARY_DIR/agent-server" "$LOCAL_BIN/agent-server"
-  echo "==> Debug binary extracted to $LOCAL_BIN/agent-server"
+  # For debug builds, also extract binary locally for symbol resolution
+  if [ "$BUILD_MODE" = "debug" ]; then
+    LOCAL_BIN="$RUST_DIR/target/debug-remote"
+    mkdir -p "$LOCAL_BIN"
+    docker cp "$TMP_CT:/target/$BINARY_DIR/agent-server" "$LOCAL_BIN/agent-server"
+    echo "==> Debug binary extracted to $LOCAL_BIN/agent-server"
+  fi
+
+  docker rm "$TMP_CT" > /dev/null
 fi
 
-docker rm "$TMP_CT" > /dev/null
+if [ "$SYNC_TOOLS" = 1 ]; then
+  if [ ! -d "$TOOLS_DIR" ]; then
+    echo "==> Skipping tools sync: $TOOLS_DIR not found" >&2
+  else
+    echo "==> Syncing docker/tools/ → $CONTAINER:/opt/tools/"
+    # Copy each regular file individually so we can chmod +x cleanly and so
+    # `docker cp` doesn't choke on the directory itself (some daemons reject
+    # `docker cp dir/. container:dest/` semantics across versions).
+    TOOL_COUNT=0
+    while IFS= read -r -d '' f; do
+      name=$(basename "$f")
+      docker cp "$f" "$CONTAINER:/opt/tools/$name"
+      TOOL_COUNT=$((TOOL_COUNT + 1))
+    done < <(find "$TOOLS_DIR" -maxdepth 1 -type f -print0)
+    # Restore executable bit (lost when host file isn't +x or fs strips it)
+    docker exec "$CONTAINER" sh -c 'chmod +x /opt/tools/*' 2>/dev/null || true
+    echo "==> Synced $TOOL_COUNT tool(s)"
+  fi
+fi
 
-# Kill server process — entrypoint restart loop brings it back with new binary
-docker exec "$CONTAINER" pkill -f '/opt/agent-server/agent-server' 2>/dev/null || true
-echo "==> Server restarting with new binary"
+if [ "$BUILD_BINARY" = 1 ]; then
+  # Kill server process — entrypoint restart loop brings it back with new binary
+  docker exec "$CONTAINER" pkill -f '/opt/agent-server/agent-server' 2>/dev/null || true
+  echo "==> Server restarting with new binary"
+else
+  echo "==> Tools-only sync done (server not restarted)"
+fi
