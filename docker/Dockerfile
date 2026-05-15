@@ -54,10 +54,11 @@ RUN mkdir -p /output && cp target/${BUILD_MODE}/agent-server /output/agent-serve
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ARG APT_MIRROR=https://mirrors.aliyun.com
+ARG UBUNTU_APT_MIRROR=http://mirrors.aliyun.com
 
-# Use Aliyun mirror for Ubuntu apt to avoid network issues with archive.ubuntu.com
-RUN sed -i "s|http://archive.ubuntu.com|${APT_MIRROR}|g; s|http://security.ubuntu.com|${APT_MIRROR}|g; s|http://ports.ubuntu.com|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true
+# Use Aliyun mirror for Ubuntu apt. http (not https) because ubuntu:22.04
+# minimal image lacks the CA chain Aliyun's cert requires.
+RUN sed -i "s|http://archive.ubuntu.com|${UBUNTU_APT_MIRROR}|g; s|http://security.ubuntu.com|${UBUNTU_APT_MIRROR}|g; s|http://ports.ubuntu.com|${UBUNTU_APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true
 
 # ============================================
 # System packages
