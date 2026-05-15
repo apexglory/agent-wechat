@@ -1,5 +1,5 @@
 {
-  "name": "@agent-wechat/wechat",
+  "name": "@apexglory/agent-wechat2-wechat",
   "version": "0.11.15",
   "type": "module",
   "files": [
@@ -12,7 +12,7 @@
     "test": "node --test --experimental-strip-types src/*.test.ts"
   },
   "devDependencies": {
-    "@agent-wechat/shared": "workspace:*",
+    "@apexglory/agent-wechat2-shared": "workspace:*",
     "@types/node": "^22",
     "esbuild": "^0.25.0",
     "openclaw": ">=2026.3.23 <2027.0.0",
@@ -32,16 +32,15 @@
       "order": 80
     },
     "install": {
-      "npmSpec": "@agent-wechat/wechat"
+      "npmSpec": "@apexglory/agent-wechat2-wechat"
     }
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/thisnick/agent-wechat.git",
+    "url": "git+https://github.com/apexglory/agent-wechat.git",
     "directory": "packages/openclaw-extension"
   }
 }

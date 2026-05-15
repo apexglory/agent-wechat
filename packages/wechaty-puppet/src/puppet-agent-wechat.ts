@@ -5,8 +5,8 @@ import { join } from 'path'
 import { homedir } from 'os'
 import { createRequire } from 'module'
 
-import { WeChatClient } from '@agent-wechat/shared'
-import type { Chat, Contact, Message, LoginSubscriptionEvent } from '@agent-wechat/shared'
+import { WeChatClient } from '@apexglory/agent-wechat2-shared'
+import type { Chat, Contact, Message, LoginSubscriptionEvent } from '@apexglory/agent-wechat2-shared'
 
 const require = createRequire(import.meta.url)
 const { version: VERSION } = require('../package.json')
@@ -57,7 +57,7 @@ export class PuppetAgentWeChat extends PUPPET.Puppet {
     if (envToken) return envToken
 
     try {
-      return readFileSync(join(homedir(), '.config', 'agent-wechat', 'token'), 'utf-8').trim()
+      return readFileSync(join(homedir(), '.config', 'agent-wechat2', 'token'), 'utf-8').trim()
     } catch {
       return undefined
     }
@@ -72,7 +72,7 @@ export class PuppetAgentWeChat extends PUPPET.Puppet {
     log.verbose('PuppetAgentWeChat', 'constructor(%s)', JSON.stringify(options))
   }
 
-  override name() { return '@agent-wechat/wechaty-puppet' }
+  override name() { return '@apexglory/agent-wechat2-wechaty-puppet' }
   override version() { return VERSION }
 
   // ==================

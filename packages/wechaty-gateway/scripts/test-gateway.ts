@@ -5,10 +5,10 @@
  *   AGENT_WECHAT_URL=http://localhost:6174 \
  *   AGENT_WECHAT_TOKEN=test \
  *   WECHATY_TOKEN=test \
- *   pnpm --filter @agent-wechat/wechaty-gateway exec -- node --import tsx src/main.ts
+ *   pnpm --filter @apexglory/agent-wechat2-wechaty-gateway exec -- node --import tsx src/main.ts
  *
  * Step 2 — Run this client (in another terminal):
- *   pnpm --filter @agent-wechat/wechaty-gateway exec -- node --import tsx scripts/test-gateway.ts
+ *   pnpm --filter @apexglory/agent-wechat2-wechaty-gateway exec -- node --import tsx scripts/test-gateway.ts
  */
 import { readFileSync } from 'fs'
 import { join } from 'path'
@@ -23,7 +23,7 @@ function getArg(name: string): string | undefined {
 
 function loadLocalToken(): string | undefined {
   try {
-    return readFileSync(join(homedir(), '.config', 'agent-wechat', 'token'), 'utf-8').trim()
+    return readFileSync(join(homedir(), '.config', 'agent-wechat2', 'token'), 'utf-8').trim()
   } catch {
     return undefined
   }
@@ -31,7 +31,7 @@ function loadLocalToken(): string | undefined {
 
 const token = getArg('token') ?? process.env['WECHATY_TOKEN'] ?? loadLocalToken()
 if (!token) {
-  console.error('No token found. Set WECHATY_TOKEN or create ~/.config/agent-wechat/token')
+  console.error('No token found. Set WECHATY_TOKEN or create ~/.config/agent-wechat2/token')
   process.exit(1)
 }
 const endpoint = getArg('endpoint') ?? '127.0.0.1:8788'

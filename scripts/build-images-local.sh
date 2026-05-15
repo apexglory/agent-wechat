@@ -93,17 +93,17 @@ trap cleanup_build_context EXIT
 
 case "$ARCH_ONLY" in
   amd64)
-    build_arch "linux/amd64" "agent-wechat:amd64"
-    printf "\nDone. Built: agent-wechat:amd64\n"
+    build_arch "linux/amd64" "agent-wechat2:amd64"
+    printf "\nDone. Built: agent-wechat2:amd64\n"
     ;;
   arm64)
-    build_arch "linux/arm64" "agent-wechat:arm64"
-    printf "\nDone. Built: agent-wechat:arm64\n"
+    build_arch "linux/arm64" "agent-wechat2:arm64"
+    printf "\nDone. Built: agent-wechat2:arm64\n"
     ;;
   both)
-    build_arch "linux/amd64" "agent-wechat:amd64"
-    build_arch "linux/arm64" "agent-wechat:arm64"
-    printf "\nDone. Built: agent-wechat:amd64, agent-wechat:arm64\n"
+    build_arch "linux/amd64" "agent-wechat2:amd64"
+    build_arch "linux/arm64" "agent-wechat2:arm64"
+    printf "\nDone. Built: agent-wechat2:amd64, agent-wechat2:arm64\n"
     ;;
   *)
     echo "unsupported arch: $ARCH_ONLY (use amd64, arm64, or both)" >&2

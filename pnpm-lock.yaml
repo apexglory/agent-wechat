@@ -44,7 +44,7 @@ importers:
         specifier: ^0.12.0
         version: 0.12.0
     devDependencies:
-      '@agent-wechat/shared':
+      '@apexglory/agent-wechat2-shared':
         specifier: workspace:*
         version: link:../shared
       '@types/node':
@@ -65,7 +65,7 @@ importers:
 
   packages/openclaw-extension:
     devDependencies:
-      '@agent-wechat/shared':
+      '@apexglory/agent-wechat2-shared':
         specifier: workspace:*
         version: link:../shared
       '@types/node':
@@ -93,10 +93,10 @@ importers:
 
   packages/wechaty-gateway:
     dependencies:
-      '@agent-wechat/shared':
+      '@apexglory/agent-wechat2-shared':
         specifier: workspace:*
         version: link:../shared
-      '@agent-wechat/wechaty-puppet':
+      '@apexglory/agent-wechat2-wechaty-puppet':
         specifier: workspace:*
         version: link:../wechaty-puppet
       file-box:
@@ -134,7 +134,7 @@ importers:
         specifier: ^1.4.15
         version: 1.4.15
     devDependencies:
-      '@agent-wechat/shared':
+      '@apexglory/agent-wechat2-shared':
         specifier: workspace:*
         version: link:../shared
       '@types/node':
@@ -5225,7 +5225,7 @@ packages:
 
   uuid@3.4.0:
     resolution: {integrity: sha512-HjSDRw6gZE5JMggctHBcjVak08+KEVhSIiDzFnT9S9aegmp85S/bReBVTb4QTFaRNptJ9kuYaNhnbNEOkbKb/A==}
-    deprecated: Please upgrade  to version 7 or higher.  Older versions may use Math.random() in certain circumstances, which is known to be problematic.  See https://v8.dev/blog/math-random for details.
+    deprecated: uuid@10 and below is no longer supported.  For ESM codebases, update to uuid@latest.  For CommonJS codebases, use uuid@11 (but be aware this version will likely be deprecated in 2028).
     hasBin: true
 
   uuid@8.3.2:

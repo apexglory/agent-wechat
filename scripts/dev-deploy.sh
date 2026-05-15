@@ -18,7 +18,7 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RUST_DIR="$ROOT_DIR/packages/agent-server-rust"
 TOOLS_DIR="$ROOT_DIR/docker/tools"
 BUILDER_IMAGE="rust:1.93-bookworm"
-CACHE_VOLUME="agent-wechat-cargo-cache"
+CACHE_VOLUME="agent-wechat2-cargo-cache"
 
 CONTAINER=""
 BUILD_MODE="debug"
@@ -53,9 +53,9 @@ done
 
 # Auto-detect container
 if [ -z "$CONTAINER" ]; then
-  CONTAINER=$(docker ps --filter "name=agent-wechat" --format '{{.Names}}' | head -1)
+  CONTAINER=$(docker ps --filter "name=agent-wechat2" --format '{{.Names}}' | head -1)
   if [ -z "$CONTAINER" ]; then
-    echo "No running agent-wechat container found. Specify with --container" >&2
+    echo "No running agent-wechat2 container found. Specify with --container" >&2
     exit 1
   fi
 fi

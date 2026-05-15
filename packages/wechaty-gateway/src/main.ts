@@ -1,5 +1,5 @@
 import { PuppetServer } from 'wechaty-puppet-service'
-import { PuppetAgentWeChat } from '@agent-wechat/wechaty-puppet'
+import { PuppetAgentWeChat } from '@apexglory/agent-wechat2-wechaty-puppet'
 import WebSocket from 'ws'
 
 const port = process.env['WECHATY_PUPPET_SERVER_PORT'] || '8788'

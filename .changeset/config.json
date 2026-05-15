@@ -1,8 +1,8 @@
 {
   "$schema": "https://unpkg.com/@changesets/config@3.1.2/schema.json",
-  "changelog": ["@changesets/changelog-github", { "repo": "thisnick/agent-wechat" }],
+  "changelog": ["@changesets/changelog-github", { "repo": "apexglory/agent-wechat" }],
   "commit": false,
-  "fixed": [["@agent-wechat/cli", "@agent-wechat/wechat", "@agent-wechat/wechaty-puppet", "@agent-wechat/wechaty-gateway", "@agent-wechat/agent-server"]],
+  "fixed": [["@apexglory/agent-wechat2-cli", "@apexglory/agent-wechat2-wechat", "@apexglory/agent-wechat2-wechaty-puppet", "@apexglory/agent-wechat2-wechaty-gateway", "@apexglory/agent-wechat2-agent-server"]],
   "linked": [],
   "access": "public",
   "baseBranch": "main",

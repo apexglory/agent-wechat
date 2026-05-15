@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import * as PUPPET from 'wechaty-puppet'
-import type { Chat, Message } from '@agent-wechat/shared'
+import type { Chat, Message } from '@apexglory/agent-wechat2-shared'
 import {
   wechatTypeToMessageType,
   chatToContactPayload,

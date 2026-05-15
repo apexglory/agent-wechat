@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Start the agent-wechat container in dev mode.
+# Start the agent-wechat2 container in dev mode.
 #
 # Usage: pnpm dev
 #
@@ -10,15 +10,15 @@
 
 set -e
 
-CONTAINER_NAME="agent-wechat"
+CONTAINER_NAME="agent-wechat2"
 DEFAULT_PORT=6174
 
 # Determine architecture
 ARCH=$(uname -m)
 if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
-  IMAGE="agent-wechat:arm64"
+  IMAGE="agent-wechat2:arm64"
 else
-  IMAGE="agent-wechat:amd64"
+  IMAGE="agent-wechat2:amd64"
 fi
 
 # Get script directory and monorepo root
@@ -29,7 +29,7 @@ MONOREPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DOCKER_TOOLS="$MONOREPO_ROOT/docker/tools"
 
 # Auto-generate auth token if needed
-TOKEN_DIR="$HOME/.config/agent-wechat"
+TOKEN_DIR="$HOME/.config/agent-wechat2"
 TOKEN_PATH="$TOKEN_DIR/token"
 if [ ! -f "$TOKEN_PATH" ]; then
   mkdir -p "$TOKEN_DIR"

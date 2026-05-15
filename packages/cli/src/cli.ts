@@ -1,5 +1,5 @@
 import { Command, Option } from "commander";
-import { WeChatClient, type WeChatClientOptions } from "@agent-wechat/shared";
+import { WeChatClient, type WeChatClientOptions } from "@apexglory/agent-wechat2-shared";
 import { createSubscriptionClient, type SubscriptionClientOptions } from "./lib/client.js";
 import { spawn, execSync } from "child_process";
 import { randomBytes } from "crypto";
@@ -11,8 +11,8 @@ import { fileURLToPath } from "url";
 
 declare const PKG_VERSION: string;
 const VERSION = PKG_VERSION;
-const CONTAINER_NAME = "agent-wechat";
-const GHCR_IMAGE = "ghcr.io/thisnick/agent-wechat";
+const CONTAINER_NAME = "agent-wechat2";
+const GHCR_IMAGE = "ghcr.io/apexglory/agent-wechat2";
 const DEFAULT_PORT = 6174;
 
 // Get monorepo root (cli is at packages/cli)
@@ -20,7 +20,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MONOREPO_ROOT = path.resolve(__dirname, "../../..");
 
 // Auth token paths
-const TOKEN_DIR = path.join(os.homedir(), ".config", "agent-wechat");
+const TOKEN_DIR = path.join(os.homedir(), ".config", "agent-wechat2");
 const TOKEN_PATH = path.join(TOKEN_DIR, "token");
 
 function ensureToken(): string {
@@ -1039,14 +1039,14 @@ async function cmdUpdate() {
   let container: string;
   try {
     container = execSync(
-      `docker ps --filter "name=agent-wechat" --format "{{.Names}}" | head -1`,
+      `docker ps --filter "name=agent-wechat2" --format "{{.Names}}" | head -1`,
       { encoding: "utf-8" }
     ).trim();
   } catch {
     container = "";
   }
   if (!container) {
-    console.error("No running agent-wechat container found.");
+    console.error("No running agent-wechat2 container found.");
     process.exit(1);
   }
 
@@ -1061,7 +1061,7 @@ async function cmdUpdate() {
   const tmpFile = path.join(os.tmpdir(), assetName);
 
   // Download binary from GitHub Releases (no gh CLI dependency)
-  const releaseUrl = `https://github.com/thisnick/agent-wechat/releases/download/v${version}/${assetName}`;
+  const releaseUrl = `https://github.com/apexglory/agent-wechat/releases/download/v${version}/${assetName}`;
   console.log(`Downloading ${assetName}...`);
   try {
     const resp = await fetch(releaseUrl, { redirect: "follow" });

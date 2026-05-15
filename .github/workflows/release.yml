@@ -97,15 +97,15 @@ jobs:
           docker run --rm \
             --platform ${{ matrix.platform }} \
             -v "$PWD/$RUST_DIR:/build" \
-            -v "agent-wechat-cargo-cache-${{ matrix.arch }}:/build/target" \
-            -v "agent-wechat-cargo-registry-${{ matrix.arch }}:/usr/local/cargo/registry" \
+            -v "agent-wechat2-cargo-cache-${{ matrix.arch }}:/build/target" \
+            -v "agent-wechat2-cargo-registry-${{ matrix.arch }}:/usr/local/cargo/registry" \
             -w /build \
             "$BUILDER_IMAGE" \
             cargo build --release
 
           # Extract binary from cache volume
           TMP_CT=$(docker create \
-            -v "agent-wechat-cargo-cache-${{ matrix.arch }}:/target:ro" \
+            -v "agent-wechat2-cargo-cache-${{ matrix.arch }}:/target:ro" \
             "$BUILDER_IMAGE")
           docker cp "$TMP_CT:/target/release/agent-server" ./agent-server
           docker rm "$TMP_CT" > /dev/null

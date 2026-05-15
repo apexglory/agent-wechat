@@ -115,7 +115,7 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile --filter @agent-wechat/docs
+        run: pnpm install --frozen-lockfile --filter @apexglory/agent-wechat2-docs
 
       - name: Build docs
-        run: pnpm --filter @agent-wechat/docs build
+        run: pnpm --filter @apexglory/agent-wechat2-docs build

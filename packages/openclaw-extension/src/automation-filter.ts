@@ -1,4 +1,4 @@
-import type { Message } from "@agent-wechat/shared";
+import type { Message } from "@apexglory/agent-wechat2-shared";
 
 // Keep this list aligned with the system/internal usernames filtered by the Rust contact API.
 // These chats are not meaningful automation targets and should never be opened by the monitor.

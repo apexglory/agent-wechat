@@ -1,8 +1,8 @@
-# @agent-wechat/wechat
+# @apexglory/agent-wechat2-wechat
 
-OpenClaw channel plugin for WeChat. Connects your OpenClaw bot to WeChat using [agent-wechat](https://github.com/thisnick/agent-wechat).
+OpenClaw channel plugin for WeChat. Connects your OpenClaw bot to WeChat using [agent-wechat](https://github.com/apexglory/agent-wechat).
 
-**[Documentation](https://thisnick.github.io/agent-wechat/integrations/openclaw/setup/)**
+**[Documentation](https://apexglory.github.io/agent-wechat/integrations/openclaw/setup/)**
 
 ## Prerequisites
 
@@ -23,7 +23,7 @@ If you need to run the server yourself:
 **Option A: CLI** (quickest for local use)
 
 ```bash
-npm install -g @agent-wechat/cli
+npm install -g @apexglory/agent-wechat2-cli
 wx up
 ```
 
@@ -31,9 +31,9 @@ wx up
 
 ```yaml
 services:
-  agent-wechat:
-    image: ghcr.io/thisnick/agent-wechat:latest
-    container_name: agent-wechat
+  agent-wechat2:
+    image: ghcr.io/apexglory/agent-wechat2:latest
+    container_name: agent-wechat2
     security_opt:
       - seccomp=unconfined
     cap_add:
@@ -41,37 +41,37 @@ services:
     ports:
       - "6174:6174"
     volumes:
-      - agent-wechat-data:/data
-      - agent-wechat-home:/home/wechat
-      - ~/.config/agent-wechat/token:/data/auth-token:ro
+      - agent-wechat2-data:/data
+      - agent-wechat2-home:/home/wechat
+      - ~/.config/agent-wechat2/token:/data/auth-token:ro
     restart: unless-stopped
 
 volumes:
-  agent-wechat-data:
-  agent-wechat-home:
+  agent-wechat2-data:
+  agent-wechat2-home:
 ```
 
 Generate a token before starting:
 
 ```bash
 mkdir -p ~/.config/agent-wechat
-openssl rand -hex 32 > ~/.config/agent-wechat/token
-chmod 600 ~/.config/agent-wechat/token
+openssl rand -hex 32 > ~/.config/agent-wechat2/token
+chmod 600 ~/.config/agent-wechat2/token
 docker compose up -d
 ```
 
-If running alongside OpenClaw on the same Docker network, set `serverUrl` to `http://agent-wechat:6174` in the channel config.
+If running alongside OpenClaw on the same Docker network, set `serverUrl` to `http://agent-wechat2:6174` in the channel config.
 
 ### 2. Install the extension
 
 ```bash
-openclaw plugins install @agent-wechat/wechat
+openclaw plugins install @apexglory/agent-wechat2-wechat
 ```
 
 ### 3. Configure the channel
 
 ```bash
-# Uses defaults (localhost:6174, token from ~/.config/agent-wechat/token)
+# Uses defaults (localhost:6174, token from ~/.config/agent-wechat2/token)
 openclaw channels add --channel wechat
 
 # Override server URL and token
@@ -93,7 +93,7 @@ Or edit `~/.openclaw/openclaw.json` directly:
 }
 ```
 
-For local setups, the token is automatically read from `~/.config/agent-wechat/token` (shared with the CLI and container), so you don't need to set it in the config. When connecting to a remote server, add the `token` field.
+For local setups, the token is automatically read from `~/.config/agent-wechat2/token` (shared with the CLI and container), so you don't need to set it in the config. When connecting to a remote server, add the `token` field.
 
 ### 4. Restart the gateway
 
@@ -143,7 +143,7 @@ All config lives under `channels.wechat` in OpenClaw's config file:
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable the WeChat channel |
 | `serverUrl` | string | — | agent-wechat REST API URL |
-| `token` | string | — | Auth token (auto-read from `~/.config/agent-wechat/token` for local setups) |
+| `token` | string | — | Auth token (auto-read from `~/.config/agent-wechat2/token` for local setups) |
 | `dmPolicy` | `"open" \| "allowlist" \| "disabled"` | `"disabled"` | Who can DM the bot |
 | `allowFrom` | string[] | `[]` | wxid allowlist for DMs (when policy is `allowlist`) |
 | `groupPolicy` | `"open" \| "allowlist" \| "disabled"` | `"disabled"` | Group message policy |
@@ -157,7 +157,7 @@ All config lives under `channels.wechat` in OpenClaw's config file:
 ### Build from source
 
 ```bash
-git clone https://github.com/thisnick/agent-wechat.git
+git clone https://github.com/apexglory/agent-wechat.git
 cd agent-wechat
 pnpm install && pnpm build
 ```

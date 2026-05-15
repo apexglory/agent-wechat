@@ -258,7 +258,7 @@ Always add a changeset when making user-facing changes (features, fixes, behavio
 
 ```markdown
 ---
-"@agent-wechat/wechat": patch
+"@apexglory/agent-wechat2-wechat": patch
 ---
 
 Short description of the change.
@@ -269,7 +269,7 @@ Use `patch` for fixes, `minor` for new features, `major` for breaking changes.
 ## Environment Variables
 
 - `AGENT_WECHAT_URL` - Override server URL (default: http://localhost:6174)
-- `AGENT_WECHAT_TOKEN` - Override auth token (default: read from `~/.config/agent-wechat/token`)
+- `AGENT_WECHAT_TOKEN` - Override auth token (default: read from `~/.config/agent-wechat2/token`)
 - `AGENT_DB_PATH` - Override SQLite DB path (default: /data/agent.db)
 - `PROXY` - Transparent proxy for container traffic (format: `user:pass@host:port`, prefix `socks5://` for SOCKS5)
 
@@ -279,7 +279,7 @@ Use `patch` for fixes, `minor` for new features, `major` for breaking changes.
 
 All HTTP and WebSocket endpoints require a bearer token. The token is auto-generated on first container start.
 
-- **Token file**: `~/.config/agent-wechat/token` (host) → `/data/auth-token` (container, read-only mount)
+- **Token file**: `~/.config/agent-wechat2/token` (host) → `/data/auth-token` (container, read-only mount)
 - **HTTP**: `Authorization: Bearer <token>` header
 - **WebSocket**: `?token=<token>` query param (native WebSocket doesn't support headers)
 - **Required**: Server refuses to start without a token (no token file or env var = startup error)

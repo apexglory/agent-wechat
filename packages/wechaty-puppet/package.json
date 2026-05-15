@@ -1,7 +1,7 @@
 {
-  "name": "@agent-wechat/wechaty-puppet",
+  "name": "@apexglory/agent-wechat2-wechaty-puppet",
   "version": "0.11.15",
-  "description": "Wechaty Puppet for agent-wechat — bridges Wechaty bots to WeChat via the agent-wechat REST/WebSocket server",
+  "description": "Wechaty Puppet for agent-wechat2 — bridges Wechaty bots to WeChat via the agent-wechat2 REST/WebSocket server",
   "type": "module",
   "main": "./dist/mod.js",
   "types": "./dist/mod.d.ts",
@@ -29,7 +29,7 @@
     "file-box": "^1.4.15"
   },
   "devDependencies": {
-    "@agent-wechat/shared": "workspace:*",
+    "@apexglory/agent-wechat2-shared": "workspace:*",
     "@types/node": "^22",
     "esbuild": "^0.25.0",
     "tsx": "^4.19.0",
@@ -37,12 +37,11 @@
     "wechaty-puppet": "^1.20.2"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/thisnick/agent-wechat.git",
+    "url": "git+https://github.com/apexglory/agent-wechat.git",
     "directory": "packages/wechaty-puppet"
   }
 }

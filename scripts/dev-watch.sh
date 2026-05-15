@@ -11,7 +11,7 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RUST_DIR="$ROOT_DIR/packages/agent-server-rust"
 BUILDER_IMAGE="rust:1.93-bookworm"
-CACHE_VOLUME="agent-wechat-cargo-cache"
+CACHE_VOLUME="agent-wechat2-cargo-cache"
 
 CONTAINER=""
 
@@ -31,9 +31,9 @@ done
 
 # Auto-detect container
 if [ -z "$CONTAINER" ]; then
-  CONTAINER=$(docker ps --filter "name=agent-wechat" --format '{{.Names}}' | head -1)
+  CONTAINER=$(docker ps --filter "name=agent-wechat2" --format '{{.Names}}' | head -1)
   if [ -z "$CONTAINER" ]; then
-    echo "No running agent-wechat container found. Start one with: pnpm dev" >&2
+    echo "No running agent-wechat2 container found. Start one with: pnpm dev" >&2
     exit 1
   fi
 fi

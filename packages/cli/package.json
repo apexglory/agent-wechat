@@ -1,5 +1,5 @@
 {
-  "name": "@agent-wechat/cli",
+  "name": "@apexglory/agent-wechat2-cli",
   "version": "0.11.15",
   "type": "module",
   "bin": {
@@ -16,7 +16,7 @@
     "qrcode-terminal": "^0.12.0"
   },
   "devDependencies": {
-    "@agent-wechat/shared": "workspace:*",
+    "@apexglory/agent-wechat2-shared": "workspace:*",
     "commander": "^14.0.3",
     "esbuild": "^0.25.0",
     "@types/node": "^22",
@@ -24,12 +24,11 @@
     "typescript": "^5.4.5"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/thisnick/agent-wechat.git",
+    "url": "git+https://github.com/apexglory/agent-wechat.git",
     "directory": "packages/cli"
   }
 }

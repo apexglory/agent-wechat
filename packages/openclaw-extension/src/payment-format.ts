@@ -1,4 +1,4 @@
-import type { Message } from "@agent-wechat/shared";
+import type { Message } from "@apexglory/agent-wechat2-shared";
 
 export function formatPaymentBody(msg: Message): string | undefined {
   if (msg.kind !== "transfer" && msg.kind !== "red_packet") {

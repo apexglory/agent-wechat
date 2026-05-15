@@ -1,5 +1,5 @@
 import type { ResolvedWeChatAccount } from "./types.js";
-import { WeChatClient } from "@agent-wechat/shared";
+import { WeChatClient } from "@apexglory/agent-wechat2-shared";
 import { runSerializedWeChatOperation } from "./operation-queue.ts";
 
 function createClient(account: ResolvedWeChatAccount) {

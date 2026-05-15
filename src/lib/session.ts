@@ -79,7 +79,7 @@ export function ensureSession(dataDir: string, sessionName: string, overrides: P
     return { ...existing, ...overrides };
   }
 
-  const defaultImage = process.env.WECHAT_DOCKER_IMAGE || "ghcr.io/agent-wechat/agent-wechat:latest";
+  const defaultImage = process.env.WECHAT_DOCKER_IMAGE || "ghcr.io/apexglory/agent-wechat2:latest";
   const session: SessionConfig = {
     name: sessionName,
     containerName: `agent-wechat-${sessionName}`,

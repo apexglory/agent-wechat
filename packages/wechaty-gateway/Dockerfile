@@ -22,10 +22,10 @@ COPY packages/wechaty-puppet/ packages/wechaty-puppet/
 COPY packages/wechaty-gateway/ packages/wechaty-gateway/
 
 # Build all packages (turbo handles dependency order)
-RUN pnpm build --filter=@agent-wechat/wechaty-gateway...
+RUN pnpm build --filter=@apexglory/agent-wechat2-wechaty-gateway...
 
 # Deploy: creates a self-contained directory with all deps resolved
-RUN pnpm --filter=@agent-wechat/wechaty-gateway deploy /deploy --prod
+RUN pnpm --filter=@apexglory/agent-wechat2-wechaty-gateway deploy /deploy --prod
 
 # ---
 

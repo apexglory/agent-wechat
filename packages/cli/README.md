@@ -1,13 +1,13 @@
-# @agent-wechat/cli
+# @apexglory/agent-wechat2-cli
 
-Command-line tool for managing agent-wechat containers and interacting with WeChat.
+Command-line tool for managing agent-wechat2 containers and interacting with WeChat.
 
-**[Documentation](https://thisnick.github.io/agent-wechat/getting-started/cli/commands/)**
+**[Documentation](https://apexglory.github.io/agent-wechat/getting-started/cli/commands/)**
 
 ## Install
 
 ```bash
-npm install -g @agent-wechat/cli
+npm install -g @apexglory/agent-wechat2-cli
 ```
 
 This installs the `wx` command globally.
@@ -45,7 +45,7 @@ wx messages send <chatId> --text "Hello"
 
 | Command | Description |
 |---------|-------------|
-| `wx up [--proxy user:pass@host:port]` | Start the agent-wechat container |
+| `wx up [--proxy user:pass@host:port]` | Start the agent-wechat2 container |
 | `wx down` | Stop and remove the container |
 | `wx logs` | Tail container logs |
 | `wx status` | Show container up/down status and login status (when available) |
@@ -124,13 +124,13 @@ The CLI reads configuration from environment variables and a local token file:
 |--------|-------------|
 | `AGENT_WECHAT_URL` | Server URL (default: `http://localhost:6174`) |
 | `AGENT_WECHAT_TOKEN` | Auth token (overrides token file) |
-| `~/.config/agent-wechat/token` | Auto-generated auth token |
+| `~/.config/agent-wechat2/token` | Auto-generated auth token |
 
 The auth token is generated automatically on first run and shared with the container via a read-only volume mount.
 
 ## Running the Container
 
-There are two ways to run the agent-wechat container.
+There are two ways to run the agent-wechat2 container.
 
 > **Note:** agent-wechat requires `SYS_PTRACE` and `seccomp=unconfined` because it uses ptrace to interact with the WeChat desktop process. It cannot run in serverless or restricted container environments (AWS Fargate, Cloud Run, Azure Container Instances, etc.). Use a VM or bare-metal Docker host.
 
@@ -142,10 +142,10 @@ The simplest way. `wx up` pulls/starts the container with the right flags, volum
 wx up
 ```
 
-This starts a container named `agent-wechat` with:
+This starts a container named `agent-wechat2` with:
 - **Port 6174** — REST API + VNC web viewer at `/vnc/` (exposed to all interfaces)
 - Persistent volumes for data and WeChat home directory
-- Auth token from `~/.config/agent-wechat/token` (auto-generated on first run)
+- Auth token from `~/.config/agent-wechat2/token` (auto-generated on first run)
 
 To route all container traffic through a proxy:
 
@@ -161,9 +161,9 @@ For production or when running alongside other services (e.g., OpenClaw), use th
 
 ```yaml
 services:
-  agent-wechat:
-    image: ghcr.io/thisnick/agent-wechat:latest
-    container_name: agent-wechat
+  agent-wechat2:
+    image: ghcr.io/apexglory/agent-wechat2:latest
+    container_name: agent-wechat2
     security_opt:
       - seccomp=unconfined
     cap_add:
@@ -172,27 +172,27 @@ services:
     ports:
       - "6174:6174"
     volumes:
-      - agent-wechat-data:/data
-      - agent-wechat-home:/home/wechat
-      - ~/.config/agent-wechat/token:/data/auth-token:ro
+      - agent-wechat2-data:/data
+      - agent-wechat2-home:/home/wechat
+      - ~/.config/agent-wechat2/token:/data/auth-token:ro
     environment:
       - PROXY=${PROXY:-}    # optional: user:pass@host:port
     restart: unless-stopped
 
 volumes:
-  agent-wechat-data:
-  agent-wechat-home:
+  agent-wechat2-data:
+  agent-wechat2-home:
 ```
 
 Generate a token before starting:
 
 ```bash
 mkdir -p ~/.config/agent-wechat
-openssl rand -hex 32 > ~/.config/agent-wechat/token
-chmod 600 ~/.config/agent-wechat/token
+openssl rand -hex 32 > ~/.config/agent-wechat2/token
+chmod 600 ~/.config/agent-wechat2/token
 ```
 
-If running alongside OpenClaw on the same Docker network, set `serverUrl` to `http://agent-wechat:6174` in your OpenClaw config.
+If running alongside OpenClaw on the same Docker network, set `serverUrl` to `http://agent-wechat2:6174` in your OpenClaw config.
 
 ### Building locally
 

@@ -1,5 +1,5 @@
 import * as PUPPET from 'wechaty-puppet'
-import type { Chat, Contact, Message } from '@agent-wechat/shared'
+import type { Chat, Contact, Message } from '@apexglory/agent-wechat2-shared'
 
 /**
  * Map WeChat message type numbers to Wechaty MessageType.

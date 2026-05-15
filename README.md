@@ -2,15 +2,15 @@
 
 A programmable WeChat interface. Controls a WeChat client running in a Docker container — receive and send messages, see chat heads, and more via API, CLI, Wechaty puppet, or OpenClaw plugin.
 
-**[Documentation](https://thisnick.github.io/agent-wechat/)**
+**[Documentation](https://apexglory.github.io/agent-wechat/)**
 
 ## Packages
 
 | Package | npm | Description |
 |---------|-----|-------------|
-| [`@agent-wechat/cli`](./packages/cli) | [![npm](https://img.shields.io/npm/v/@agent-wechat/cli)](https://www.npmjs.com/package/@agent-wechat/cli) | CLI for managing the Docker container and interacting with WeChat |
-| [`@agent-wechat/wechaty-puppet`](./packages/wechaty-puppet) | [![npm](https://img.shields.io/npm/v/@agent-wechat/wechaty-puppet)](https://www.npmjs.com/package/@agent-wechat/wechaty-puppet) | [Wechaty](https://wechaty.js.org) puppet for agent-wechat |
-| [`@agent-wechat/wechat`](./packages/openclaw-extension) | [![npm](https://img.shields.io/npm/v/@agent-wechat/wechat)](https://www.npmjs.com/package/@agent-wechat/wechat) | [OpenClaw](https://openclaw.ai) extension for AI agent integration |
+| [`@apexglory/agent-wechat2-cli`](./packages/cli) | [![npm](https://img.shields.io/npm/v/@apexglory/agent-wechat2-cli)](https://www.npmjs.com/package/@apexglory/agent-wechat2-cli) | CLI for managing the Docker container and interacting with WeChat |
+| [`@apexglory/agent-wechat2-wechaty-puppet`](./packages/wechaty-puppet) | [![npm](https://img.shields.io/npm/v/@apexglory/agent-wechat2-wechaty-puppet)](https://www.npmjs.com/package/@apexglory/agent-wechat2-wechaty-puppet) | [Wechaty](https://wechaty.js.org) puppet for agent-wechat |
+| [`@apexglory/agent-wechat2-wechat`](./packages/openclaw-extension) | [![npm](https://img.shields.io/npm/v/@apexglory/agent-wechat2-wechat)](https://www.npmjs.com/package/@apexglory/agent-wechat2-wechat) | [OpenClaw](https://openclaw.ai) extension for AI agent integration |
 
 ## What It Does
 
@@ -30,7 +30,7 @@ A programmable WeChat interface. Controls a WeChat client running in a Docker co
 
 ```bash
 # Install the CLI
-npm install -g @agent-wechat/cli
+npm install -g @apexglory/agent-wechat2-cli
 
 # Start the container (auto-pulls Docker image)
 wx up
@@ -92,7 +92,7 @@ wx down
 **Option A: Via CLI** (recommended)
 
 ```bash
-wx up    # auto-pulls ghcr.io/thisnick/agent-wechat
+wx up    # auto-pulls ghcr.io/apexglory/agent-wechat2
 ```
 
 **Option B: Docker Compose** (for custom networking)
@@ -102,12 +102,12 @@ See [`docker-compose.yml`](./docker-compose.yml) for a full example. Key points:
 ```yaml
 # Generate a token first:
 #   mkdir -p ~/.config/agent-wechat
-#   openssl rand -hex 32 > ~/.config/agent-wechat/token
-#   chmod 600 ~/.config/agent-wechat/token
+#   openssl rand -hex 32 > ~/.config/agent-wechat2/token
+#   chmod 600 ~/.config/agent-wechat2/token
 
 services:
-  agent-wechat:
-    image: ghcr.io/thisnick/agent-wechat:latest
+  agent-wechat2:
+    image: ghcr.io/apexglory/agent-wechat2:latest
     security_opt:
       - seccomp=unconfined
     cap_add:
@@ -116,16 +116,16 @@ services:
     ports:
       - "6174:6174"
     volumes:
-      - agent-wechat-data:/data
-      - agent-wechat-home:/home/wechat
-      - ~/.config/agent-wechat/token:/data/auth-token:ro
+      - agent-wechat2-data:/data
+      - agent-wechat2-home:/home/wechat
+      - ~/.config/agent-wechat2/token:/data/auth-token:ro
     environment:
       - PROXY=${PROXY:-}    # optional: user:pass@host:port
     restart: unless-stopped
 
 volumes:
-  agent-wechat-data:
-  agent-wechat-home:
+  agent-wechat2-data:
+  agent-wechat2-home:
 ```
 
 ## Development
@@ -148,10 +148,10 @@ See [CLAUDE.md](./CLAUDE.md) for full technical documentation.
 
 
 # 1. 进入容器查看 VNC 进程
-docker exec agent-wechat ps aux | grep -i vnc
+docker exec agent-wechat2 ps aux | grep -i vnc
 
 # 2. 关闭原 VNC 进程 (PID 47)
-docker exec agent-wechat kill
+docker exec agent-wechat2 kill
 
 # 3. 重启 VNC（去掉 -viewonly）
-docker exec -d agent-wechat x11vnc -display :99 -forever -nopw -shared -xkb -rfbport 5900 -listen 127.0.0.1
+docker exec -d agent-wechat2 x11vnc -display :99 -forever -nopw -shared -xkb -rfbport 5900 -listen 127.0.0.1

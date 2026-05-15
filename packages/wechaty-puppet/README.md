@@ -1,14 +1,14 @@
-# @agent-wechat/wechaty-puppet
+# @apexglory/agent-wechat2-wechaty-puppet
 
-Wechaty Puppet for [agent-wechat](https://github.com/thisnick/agent-wechat). Bridges any Wechaty bot to WeChat via the agent-wechat REST/WebSocket server.
+Wechaty Puppet for [agent-wechat](https://github.com/apexglory/agent-wechat). Bridges any Wechaty bot to WeChat via the agent-wechat REST/WebSocket server.
 
-**[Documentation](https://thisnick.github.io/agent-wechat/integrations/wechaty/puppet-setup/)**
+**[Documentation](https://apexglory.github.io/agent-wechat/integrations/wechaty/puppet-setup/)**
 
 ## Prerequisites
 
-- **An agent-wechat server** running — set up via the CLI or from the [agent-wechat repo](https://github.com/thisnick/agent-wechat):
+- **An agent-wechat server** running — set up via the CLI or from the [agent-wechat repo](https://github.com/apexglory/agent-wechat):
   ```bash
-  npx @agent-wechat/cli up     # starts the Docker container
+  npx @apexglory/agent-wechat2-cli up     # starts the Docker container
   ```
   Login is not required as a separate CLI step; you can log in through the puppet QR flow.
 - **Node.js >= 22**
@@ -16,19 +16,19 @@ Wechaty Puppet for [agent-wechat](https://github.com/thisnick/agent-wechat). Bri
 ## Install
 
 ```bash
-npm install @agent-wechat/wechaty-puppet wechaty wechaty-puppet
+npm install @apexglory/agent-wechat2-wechaty-puppet wechaty wechaty-puppet
 ```
 
 ## Usage
 
 ```ts
 import { WechatyBuilder } from 'wechaty'
-import PuppetAgentWeChat from '@agent-wechat/wechaty-puppet'
+import PuppetAgentWeChat from '@apexglory/agent-wechat2-wechaty-puppet'
 
 const bot = WechatyBuilder.build({
   puppet: new PuppetAgentWeChat({
     serverUrl: 'http://localhost:6174',  // optional, this is the default
-    token: 'your-token',                 // optional, reads from ~/.config/agent-wechat/token
+    token: 'your-token',                 // optional, reads from ~/.config/agent-wechat2/token
   })
 })
 
@@ -52,7 +52,7 @@ await bot.start()
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `serverUrl` | string | `http://localhost:6174` | agent-wechat server URL |
-| `token` | string | auto | Auth token. Falls back to `AGENT_WECHAT_TOKEN` env var, then `~/.config/agent-wechat/token` |
+| `token` | string | auto | Auth token. Falls back to `AGENT_WECHAT_TOKEN` env var, then `~/.config/agent-wechat2/token` |
 | `pollIntervalMs` | number | `2000` | Message polling interval in milliseconds |
 
 ## Supported Features
