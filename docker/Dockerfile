@@ -99,14 +99,16 @@ RUN apt-get update && apt-get install -y \
 # ============================================
 # Python packages
 # ============================================
-RUN pip3 install frida-tools silk-python
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+RUN pip3 install --index-url "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" frida-tools silk-python
 
 # ============================================
 # noVNC (browser-based VNC viewer) + websockify
 # ============================================
 ARG NOVNC_VERSION=1.5.0
-RUN pip3 install websockify \
-    && curl -L https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz | tar xz -C /opt \
+RUN pip3 install --index-url "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" websockify \
+    && curl -L --retry 5 --retry-delay 5 --connect-timeout 30 https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz | tar xz -C /opt \
     && mv /opt/noVNC-${NOVNC_VERSION} /opt/novnc
 
 # ============================================
