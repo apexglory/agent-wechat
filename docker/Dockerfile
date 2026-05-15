@@ -4,8 +4,13 @@
 FROM rust:1.93-bookworm AS builder
 
 ARG BUILD_MODE=release
+ARG APT_MIRROR=https://mirrors.aliyun.com
 
 WORKDIR /build
+
+# Use Aliyun mirror for Debian apt to avoid network issues with archive.ubuntu.com
+RUN sed -i "s|http://deb.debian.org|${APT_MIRROR}|g; s|http://security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null \
+    || sed -i "s|http://deb.debian.org|${APT_MIRROR}|g; s|http://security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true
 
 # Install build dependencies for bundled sqlcipher + openssl
 RUN apt-get update && apt-get install -y \
@@ -34,6 +39,10 @@ RUN mkdir -p /output && cp target/${BUILD_MODE}/agent-server /output/agent-serve
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+ARG APT_MIRROR=https://mirrors.aliyun.com
+
+# Use Aliyun mirror for Ubuntu apt to avoid network issues with archive.ubuntu.com
+RUN sed -i "s|http://archive.ubuntu.com|${APT_MIRROR}|g; s|http://security.ubuntu.com|${APT_MIRROR}|g; s|http://ports.ubuntu.com|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true
 
 # ============================================
 # System packages
