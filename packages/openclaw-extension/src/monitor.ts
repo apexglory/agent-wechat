@@ -28,17 +28,45 @@ const MEDIA_TYPES = new Set([3, 34, 43]); // image, voice, video
 // ============================================================
 // A11y fast-path state (module-level, shared across accounts)
 //
-// Detects inbound DM text messages via the a11y tree ~7-9s before
-// WCDB flushes SessionTable. The trailing `unreadCount` items of
-// each open chat frame (sorted by bounds.y) are treated as new;
-// dedup ringbuffers prevent re-dispatch and DB-path double-processing.
-// Media / transfer / red-packet still fall back to the DB path.
+// WeChat's a11y tree collapses every chat bubble to a single list-item
+// with text in `name` and no children/states — so inbound vs outbound
+// is invisible at this layer. Instead we track the bottom-most visible
+// bubble per chat as a high-water mark: items below the marker are new,
+// items at-or-above are already-seen (including bot's own replies).
+// The send path updates the marker as soon as the bot delivers a reply,
+// so its own bubble can never be misread as a new inbound message.
+//
+// Two TTL ringbuffers remain as defense-in-depth: recentlySentReplies
+// (bot outbound texts) and a11yDispatchedContent (texts already pushed
+// once). Both also gate the DB-path catch-up loop so the eventual real
+// message isn't double-processed.
 // ============================================================
 type RecentEntry = { text: string; ts: number };
-const A11Y_DEDUP_WINDOW_MS = 120_000; // 2 min
+const A11Y_DEDUP_WINDOW_MS = 1_800_000; // 30 min — bubbles can stay visible far longer than 2 min
 
-const recentlySentReplies = new Map<string, RecentEntry[]>();   // wxid -> outbound texts (dedup bot's own)
-const a11yDispatchedContent = new Map<string, RecentEntry[]>(); // wxid -> contents already dispatched via a11y
+const recentlySentReplies = new Map<string, RecentEntry[]>();   // wxid -> normalized outbound texts (dedup bot's own)
+const a11yDispatchedContent = new Map<string, RecentEntry[]>(); // wxid -> normalized contents already dispatched via a11y
+// Per-chat normalized text of the most recent visible bubble (bot's reply OR last dispatch).
+// Items appearing below this marker on the next poll are the only candidates for dispatch.
+const a11yChatBottom = new Map<string, string>();
+
+function normalizeBubbleText(s: string): string {
+  // WeChat tends to append "\n " to bubble labels; long bubbles are also
+  // truncated in atspi. Collapse runs of whitespace to a single space so
+  // recordings and a11y reads compare consistently.
+  return s.replace(/\s+/g, " ").trim();
+}
+
+function bubblesMatch(a: string, b: string): boolean {
+  // Both inputs already normalized.
+  if (a === b) return true;
+  // a11y may truncate long bubbles. If either is a prefix of the other
+  // (and not trivially short), treat as the same bubble.
+  if (a.length >= 12 && b.length >= 12) {
+    if (a.startsWith(b) || b.startsWith(a)) return true;
+  }
+  return false;
+}
 
 // Unique negative localId per a11y-dispatched message, so openclaw's
 // inbound MessageSid dedup (wechat:<chat>:<localId>) doesn't collapse
@@ -75,7 +103,7 @@ function recentContains(map: Map<string, RecentEntry[]>, key: string, text: stri
   const arr = map.get(key);
   if (!arr) return false;
   const cutoff = Date.now() - A11Y_DEDUP_WINDOW_MS;
-  return arr.some((e) => e.ts >= cutoff && e.text === text);
+  return arr.some((e) => e.ts >= cutoff && bubblesMatch(e.text, text));
 }
 
 // History context markers (match openclaw's built-in markers)
@@ -436,37 +464,73 @@ export async function startWeChatMonitor(
           if (!items || items.length === 0) continue; // no messages list yet
 
           // Sort by bounds.y ascending → visual top-to-bottom (oldest first, newest last).
-          // Then take the trailing `unread` non-timestamp items as the candidates —
-          // this is the authoritative signal from the main-window unread badge.
           const ordered = [...items]
             .map((it) => ({ raw: it.name, y: it.bounds?.y ?? 0 }))
             .sort((a, b) => a.y - b.y);
-          const nonTs = ordered.filter(
-            (it) => !A11Y_TIMESTAMP_ROW_RE.test(it.raw.trim()),
-          );
-          const candidates = nonTs.slice(-unreadChat.unread);
-          if (candidates.length === 0) continue;
-
-          for (const item of candidates) {
-            const trimmed = item.raw.replace(/\n\s*$/, "").trim();
+          // Drop timestamp / media / empty / payment bubbles up-front so the
+          // bottom marker is the LAST DISPATCHABLE bubble — otherwise a stray
+          // timestamp row at the end would shift the marker and re-dispatch
+          // the bubble above it forever.
+          const eligible: Array<{ trimmed: string; norm: string }> = [];
+          for (const it of ordered) {
+            if (A11Y_TIMESTAMP_ROW_RE.test(it.raw.trim())) continue;
+            const trimmed = it.raw.replace(/\n\s*$/, "").trim();
             if (trimmed.length === 0) continue;
-            // Phase 1: skip media / transfer / red-packet / voice — DB path handles these
             if (A11Y_MEDIA_TAG_RE.test(trimmed)) continue;
             if (A11Y_AUDIO_NAME_RE.test(trimmed)) continue;
             if (trimmed.startsWith("Image") && trimmed.length < 20) continue;
             if (trimmed.startsWith("[Red packet")) continue;
             if (trimmed.startsWith("￥")) continue;
-            // Bot's own outbound reply, echoed back in the messages list
-            if (recentContains(recentlySentReplies, wxid, trimmed)) continue;
-            // Already dispatched in a prior a11y poll
-            if (recentContains(a11yDispatchedContent, wxid, trimmed)) continue;
+            eligible.push({ trimmed, norm: normalizeBubbleText(trimmed) });
+          }
+          if (eligible.length === 0) continue;
 
-            recordRecent(a11yDispatchedContent, wxid, trimmed);
+          // High-water mark: items below the previously-recorded bottom
+          // bubble are the new ones. Anything at-or-above (including bot's
+          // own replies, since the send path updates the marker) is skipped.
+          const bottomMarker = a11yChatBottom.get(wxid);
+          let candidates: Array<{ trimmed: string; norm: string }>;
+          let markerFound = false;
+          if (bottomMarker) {
+            let idx = -1;
+            for (let i = eligible.length - 1; i >= 0; i--) {
+              if (bubblesMatch(eligible[i].norm, bottomMarker)) {
+                idx = i;
+                break;
+              }
+            }
+            if (idx >= 0) {
+              candidates = eligible.slice(idx + 1);
+              markerFound = true;
+            } else {
+              // Marker scrolled off (chat scrolled, bot restart, etc.):
+              // fall back to the unread-badge slice. Conservative — may
+              // re-dispatch a small window once, then the marker reseats.
+              candidates = eligible.slice(-unreadChat.unread);
+            }
+          } else {
+            // First observation for this chat — trust the unread badge.
+            candidates = eligible.slice(-unreadChat.unread);
+          }
+
+          // Always reseat the marker to the current bottom-most eligible
+          // bubble, regardless of whether anything got dispatched. This is
+          // what stops repeat dispatches at the 2-min TTL boundary.
+          const lastEligible = eligible[eligible.length - 1];
+          a11yChatBottom.set(wxid, lastEligible.norm);
+
+          for (const item of candidates) {
+            // Defense-in-depth: bot's own reply (e.g. sent before marker
+            // logic ran) or a duplicate from an earlier a11y poll.
+            if (recentContains(recentlySentReplies, wxid, item.norm)) continue;
+            if (recentContains(a11yDispatchedContent, wxid, item.norm)) continue;
+
+            recordRecent(a11yDispatchedContent, wxid, item.norm);
             log?.info?.(
-              `[wechat:${account.accountId}] a11y fast-path dispatching to ${unreadChat.name} (unread=${unreadChat.unread}): ${trimmed.slice(0, 60)}`,
+              `[wechat:${account.accountId}] a11y fast-path dispatching to ${unreadChat.name} (unread=${unreadChat.unread}, marker=${markerFound ? "hit" : "miss"}): ${item.trimmed.slice(0, 60)}`,
             );
             try {
-              await dispatchA11yTextMessage(client, account, cfg, chat, trimmed, log);
+              await dispatchA11yTextMessage(client, account, cfg, chat, item.trimmed, log);
             } catch (err) {
               log?.error?.(
                 `[wechat:${account.accountId}] a11y fast-path dispatch failed: ${err}`,
@@ -593,9 +657,10 @@ async function prepareMessage(
     return null;
   }
 
-  // Skip if already dispatched via a11y fast path (DM text dedup)
+  // Skip if already dispatched via a11y fast path (DM text dedup).
+  // recentContains uses bubblesMatch which expects normalized inputs.
   if (msg.kind === "text" && msg.content) {
-    if (recentContains(a11yDispatchedContent, chatId, msg.content)) {
+    if (recentContains(a11yDispatchedContent, chatId, normalizeBubbleText(msg.content))) {
       log?.info?.(
         `[wechat:${liveAccount.accountId}] Skipping msg ${msg.localId} — already dispatched via a11y fast path`,
       );
@@ -1078,11 +1143,17 @@ async function dispatchSegment(
                 // Send text caption separately if present
                 if (text) {
                   await sendTextWithFastFallback(client, chat, chatId, text, log);
-                  recordRecent(recentlySentReplies, chatId, text);
+                  const norm = normalizeBubbleText(text);
+                  recordRecent(recentlySentReplies, chatId, norm);
+                  // Reseat the fast-path marker on the bot's own bubble so
+                  // the next a11y poll won't read it as a new inbound msg.
+                  a11yChatBottom.set(chatId, norm);
                 }
               } else if (text) {
                 await sendTextWithFastFallback(client, chat, chatId, text, log);
-                recordRecent(recentlySentReplies, chatId, text);
+                const norm = normalizeBubbleText(text);
+                recordRecent(recentlySentReplies, chatId, norm);
+                a11yChatBottom.set(chatId, norm);
               }
             },
             log,
