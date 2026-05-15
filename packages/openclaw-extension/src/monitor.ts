@@ -521,6 +521,27 @@ export async function startWeChatMonitor(
         }
       }
 
+      // ---- Seed lastSeenId for first-time-seen chats with no unread ----
+      // On startup, a11y `autoOpen: true` may have opened a chat window and
+      // cleared its unread badge before the JS code observes it, so
+      // unreadCount=0 even though the chat has messages newer than anything
+      // the (in-memory) lastSeenId map knows about. Without seeding, the
+      // catch-up loop below would skip the chat forever (prevSeen===undefined),
+      // and new messages would silently be missed. Seed to lastMsgLocalId-1
+      // so the catch-up loop fires once for the newest message and
+      // processUnreadChat takes over from there. Chats with unread>0 are left
+      // alone — processUnreadChat's firstPoll path seeds them correctly.
+      for (const chat of chats) {
+        const chatId = chat.username ?? chat.id;
+        if (!chatId) continue;
+        if (lastSeenId.has(chatId)) continue;
+        if (!chat.lastMsgLocalId) continue;
+        if (chat.unreadCount > 0) continue;
+        if (isAutomationIgnoredChatId(chatId)) continue;
+        const seedId = Math.max(0, chat.lastMsgLocalId - 1);
+        lastSeenId.set(chatId, seedId);
+      }
+
       // ---- Catch-up: check tracked chats where lastMsgLocalId advanced past lastSeenId ----
       for (const chat of chats) {
         if (abortSignal.aborted) break;
