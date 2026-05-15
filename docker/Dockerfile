@@ -18,19 +18,19 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Use rsproxy.cn sparse index to speed up crate downloads from China
-RUN mkdir -p /usr/local/cargo && cat > /usr/local/cargo/config.toml <<'EOF'
-[source.crates-io]
-replace-with = "rsproxy-sparse"
-
-[source.rsproxy-sparse]
-registry = "sparse+https://rsproxy.cn/index/"
-
-[registries.rsproxy]
-index = "https://rsproxy.cn/crates.io-index"
-
-[net]
-git-fetch-with-cli = true
-EOF
+RUN mkdir -p /usr/local/cargo && printf '%s\n' \
+    '[source.crates-io]' \
+    'replace-with = "rsproxy-sparse"' \
+    '' \
+    '[source.rsproxy-sparse]' \
+    'registry = "sparse+https://rsproxy.cn/index/"' \
+    '' \
+    '[registries.rsproxy]' \
+    'index = "https://rsproxy.cn/crates.io-index"' \
+    '' \
+    '[net]' \
+    'git-fetch-with-cli = true' \
+    > /usr/local/cargo/config.toml
 
 # Copy manifests first for dependency caching
 COPY agent-server-rust/Cargo.toml agent-server-rust/Cargo.lock* ./
