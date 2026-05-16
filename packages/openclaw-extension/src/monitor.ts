@@ -36,13 +36,19 @@ const MEDIA_TYPES = new Set([3, 34, 43]); // image, voice, video
 // The send path updates the marker as soon as the bot delivers a reply,
 // so its own bubble can never be misread as a new inbound message.
 //
-// Two TTL ringbuffers remain as defense-in-depth: recentlySentReplies
-// (bot outbound texts) and a11yDispatchedContent (texts already pushed
-// once). Both also gate the DB-path catch-up loop so the eventual real
-// message isn't double-processed.
+// Dedup ringbuffers (defense-in-depth, NOT the primary new-vs-old judge):
+//   recentlySentReplies     — bot outbound texts, guards against echo of bot
+//                             bubbles in case the marker fails to update.
+//   a11yDispatchedContent   — texts dispatched via fast-path, used ONLY by
+//                             the DB catch-up loop to skip the ~9s race
+//                             between fast-path dispatch and WCDB flush.
+// The marker is the sole "is this a new message" judge — repeating-text
+// dedup at content level is intentionally NOT applied in fast-path itself,
+// otherwise legitimate user repeats like "2" → bot reply → "2" get killed.
 // ============================================================
 type RecentEntry = { text: string; ts: number };
-const A11Y_DEDUP_WINDOW_MS = 1_800_000; // 30 min — bubbles can stay visible far longer than 2 min
+const A11Y_DEDUP_WINDOW_MS = 1_800_000;  // 30 min — recentlySentReplies safety net
+const A11Y_DB_RACE_WINDOW_MS = 30_000;   // 30 s  — fast-path→DB catch-up race window
 
 const recentlySentReplies = new Map<string, RecentEntry[]>();   // wxid -> normalized outbound texts (dedup bot's own)
 const a11yDispatchedContent = new Map<string, RecentEntry[]>(); // wxid -> normalized contents already dispatched via a11y
@@ -99,10 +105,15 @@ function recordRecent(map: Map<string, RecentEntry[]>, key: string, text: string
   map.set(key, arr);
 }
 
-function recentContains(map: Map<string, RecentEntry[]>, key: string, text: string): boolean {
+function recentContains(
+  map: Map<string, RecentEntry[]>,
+  key: string,
+  text: string,
+  windowMs: number = A11Y_DEDUP_WINDOW_MS,
+): boolean {
   const arr = map.get(key);
   if (!arr) return false;
-  const cutoff = Date.now() - A11Y_DEDUP_WINDOW_MS;
+  const cutoff = Date.now() - windowMs;
   return arr.some((e) => e.ts >= cutoff && bubblesMatch(e.text, text));
 }
 
@@ -520,11 +531,16 @@ export async function startWeChatMonitor(
           a11yChatBottom.set(wxid, lastEligible.norm);
 
           for (const item of candidates) {
-            // Defense-in-depth: bot's own reply (e.g. sent before marker
-            // logic ran) or a duplicate from an earlier a11y poll.
+            // Defense-in-depth: bot's own reply, in case the send path's
+            // marker reseat hasn't landed yet (e.g. media-only reply).
+            // NOTE: we do NOT also reject against a11yDispatchedContent
+            // here. The marker already gives us "consecutive duplicates
+            // only" semantics; rejecting on a 30-min text ring would kill
+            // legitimate user repeats like: "2" → bot reply → "2".
             if (recentContains(recentlySentReplies, wxid, item.norm)) continue;
-            if (recentContains(a11yDispatchedContent, wxid, item.norm)) continue;
 
+            // Recorded for the DB catch-up loop to skip the same text when
+            // WCDB flushes ~9s later (the A11Y_DB_RACE_WINDOW_MS lookup).
             recordRecent(a11yDispatchedContent, wxid, item.norm);
             log?.info?.(
               `[wechat:${account.accountId}] a11y fast-path dispatching to ${unreadChat.name} (unread=${unreadChat.unread}, marker=${markerFound ? "hit" : "miss"}): ${item.trimmed.slice(0, 60)}`,
@@ -657,10 +673,19 @@ async function prepareMessage(
     return null;
   }
 
-  // Skip if already dispatched via a11y fast path (DM text dedup).
-  // recentContains uses bubblesMatch which expects normalized inputs.
+  // Skip if already dispatched via a11y fast path within the WCDB flush
+  // race window (~9s). Using a short window — not the long safety-net TTL —
+  // so that a user who legitimately repeats the same text minutes later
+  // doesn't get silently dropped here.
   if (msg.kind === "text" && msg.content) {
-    if (recentContains(a11yDispatchedContent, chatId, normalizeBubbleText(msg.content))) {
+    if (
+      recentContains(
+        a11yDispatchedContent,
+        chatId,
+        normalizeBubbleText(msg.content),
+        A11Y_DB_RACE_WINDOW_MS,
+      )
+    ) {
       log?.info?.(
         `[wechat:${liveAccount.accountId}] Skipping msg ${msg.localId} — already dispatched via a11y fast path`,
       );
