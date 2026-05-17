@@ -437,7 +437,20 @@ export async function startWeChatMonitor(
       // ~9s flush lag. The eventual DB-path processUnreadChat will see these
       // same messages later and skip them via a11yDispatchedContent dedup in
       // prepareMessage.
-      if (a11yState && a11yState.chatsWithUnread.length > 0) {
+      //
+      // Escape hatch: set OPENCLAW_WECHAT_A11Y_DISABLE=1 on the gateway env
+      // to skip the fast-path entirely and fall back to the polling/DB path.
+      // The DB path already has a working isSelf filter, so this kills the
+      // self-echo loop you get when bot-outbound messages are sent through
+      // channels that don't reseat the a11yChatBottom marker (e.g. a sibling
+      // openclaw extension calling sendMessage directly without going through
+      // sendTextWithFastFallback). Cost: replies wait one DB poll instead of
+      // showing up via a11y inside ~1s.
+      if (
+        process.env.OPENCLAW_WECHAT_A11Y_DISABLE !== "1" &&
+        a11yState &&
+        a11yState.chatsWithUnread.length > 0
+      ) {
         // Map a11y display name → Chat. Build TWO sets: dispatchable
         // (DM, non-ignored) and ignoredNames (so we can silently skip
         // official accounts / system chats / groups without log spam).
