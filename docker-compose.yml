@@ -6,7 +6,7 @@
 
 services:
   agent-wechat2:
-    image: ghcr.io/apexglory/agent-wechat2:latest
+    image: ghcr.io/apexglory/agent-wechat2:0.11.15
     container_name: agent-wechat2
     security_opt:
       - seccomp=unconfined
