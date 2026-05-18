@@ -21,9 +21,82 @@ import {
 } from "./automation-filter.js";
 import { runSerializedWeChatOperation } from "./operation-queue.ts";
 import { formatPaymentBody } from "./payment-format.js";
+import * as fsp from "node:fs/promises";
+import * as path from "node:path";
 
 // Message types that may have downloadable media
 const MEDIA_TYPES = new Set([3, 34, 43]); // image, voice, video
+
+// ============================================================
+// Persisted lastSeenId — survives gateway restarts so we don't
+// re-process the same inbound message (and re-trigger the LLM /
+// re-spend tokens) just because in-memory state was lost.
+// Storage: $STATE_DIR/extensions/wechat/lastseen-<accountId>.json
+// ============================================================
+function lastSeenStorePath(accountId: string): string {
+  const core = getWeChatRuntime();
+  const stateDir = core.state.resolveStateDir();
+  return path.join(
+    stateDir,
+    "extensions",
+    "wechat",
+    `lastseen-${encodeURIComponent(accountId)}.json`,
+  );
+}
+
+async function loadLastSeenFromDisk(
+  accountId: string,
+  log?: { info?: (...args: any[]) => void; error?: (...args: any[]) => void },
+): Promise<Map<string, number>> {
+  const filePath = lastSeenStorePath(accountId);
+  try {
+    const data = await fsp.readFile(filePath, "utf8");
+    const obj = JSON.parse(data) as Record<string, number>;
+    const map = new Map<string, number>();
+    for (const [k, v] of Object.entries(obj)) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) map.set(k, n);
+    }
+    log?.info?.(
+      `[wechat:${accountId}] Loaded lastSeenId from ${filePath}: ${map.size} chat(s)`,
+    );
+    return map;
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") {
+      log?.error?.(
+        `[wechat:${accountId}] Failed to load lastSeenId from ${filePath}: ${err}`,
+      );
+    }
+    return new Map();
+  }
+}
+
+async function persistLastSeenId(
+  accountId: string,
+  lastSeenId: Map<string, number>,
+): Promise<void> {
+  const filePath = lastSeenStorePath(accountId);
+  await fsp.mkdir(path.dirname(filePath), { recursive: true });
+  const tmp = filePath + ".tmp";
+  await fsp.writeFile(tmp, JSON.stringify(Object.fromEntries(lastSeenId)));
+  await fsp.rename(tmp, filePath);
+}
+
+/** Update lastSeenId and persist atomically. Logs (but does not throw) on write failure. */
+async function setLastSeenAndPersist(
+  accountId: string,
+  lastSeenId: Map<string, number>,
+  chatId: string,
+  value: number,
+  log?: { info?: (...args: any[]) => void; error?: (...args: any[]) => void },
+): Promise<void> {
+  lastSeenId.set(chatId, value);
+  try {
+    await persistLastSeenId(accountId, lastSeenId);
+  } catch (err) {
+    log?.error?.(`[wechat:${accountId}] Failed to persist lastSeenId: ${err}`);
+  }
+}
 
 // ============================================================
 // A11y fast-path state (module-level, shared across accounts)
@@ -252,7 +325,16 @@ async function sendTextWithFastFallback(
       log?.info?.(`[wechat] sendFast threw, falling back: ${err}`);
     }
   }
-  await client.sendMessage({ chatId, text });
+  // Crucially: respect SendResult.success. Rust SendMessagePlan can return
+  // success=false (chat-select missed, send button never re-enabled, etc.)
+  // and historically we silently ignored it — caller would see "Queue end"
+  // with no error, lastSeenId would advance, and the user would never get
+  // the reply. Throw so the outer pipeline reports the failure and the
+  // catch-up loop retries on the next poll.
+  const result = await client.sendMessage({ chatId, text });
+  if (!result.success) {
+    throw new Error(`sendMessage failed: ${result.error ?? "unknown"}`);
+  }
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -311,8 +393,10 @@ export async function startWeChatMonitor(
   const { account, abortSignal, setStatus, log } = opts;
   const client = new WeChatClient({ baseUrl: account.serverUrl, token: account.token });
 
-  // Track last-seen message ID per chat
-  const lastSeenId = new Map<string, number>();
+  // Track last-seen message ID per chat. Persisted across gateway restarts
+  // so msgs already handed off to the LLM aren't re-dispatched after a
+  // restart re-seeds in-memory state.
+  const lastSeenId = await loadLastSeenFromDisk(account.accountId, log);
 
   // Buffer non-mentioned group messages for catch-up context
   const groupHistory = new Map<string, ProcessedMessage[]>();
@@ -637,7 +721,7 @@ export async function startWeChatMonitor(
         if (chat.unreadCount > 0) continue;
         if (isAutomationIgnoredChatId(chatId)) continue;
         const seedId = Math.max(0, chat.lastMsgLocalId - 1);
-        lastSeenId.set(chatId, seedId);
+        await setLastSeenAndPersist(account.accountId, lastSeenId, chatId, seedId, log);
       }
 
       // ---- Catch-up: check tracked chats where lastMsgLocalId advanced past lastSeenId ----
@@ -1174,10 +1258,13 @@ async function dispatchSegment(
                     }
 
                     const isImage = mimeType.startsWith("image/");
-                    if (isImage) {
-                      await client.sendMessage({ chatId, image: { data: base64, mimeType } });
-                    } else {
-                      await client.sendMessage({ chatId, file: { data: base64, filename } });
+                    const sendResult = isImage
+                      ? await client.sendMessage({ chatId, image: { data: base64, mimeType } })
+                      : await client.sendMessage({ chatId, file: { data: base64, filename } });
+                    if (!sendResult.success) {
+                      throw new Error(
+                        `sendMessage(${isImage ? "image" : "file"}) failed: ${sendResult.error ?? "unknown"}`,
+                      );
                     }
                   } catch (err) {
                     log?.error?.(`[wechat:${liveAccount.accountId}] Failed to send media: ${err}`);
@@ -1314,14 +1401,14 @@ async function processUnreadChat(
     if (unread > 0 && unread < messages.length) {
       newMessages = messages.slice(-unread);
       const seenMax = messages[messages.length - unread - 1].localId;
-      lastSeenId.set(chatId, seenMax);
+      await setLastSeenAndPersist(liveAccount.accountId, lastSeenId, chatId, seenMax, log);
     } else if (unread >= messages.length) {
       // All fetched messages are unread
       newMessages = messages;
     } else {
       // No unreads — just seed lastSeenId, don't process anything
       const maxId = messages[messages.length - 1].localId;
-      lastSeenId.set(chatId, maxId);
+      await setLastSeenAndPersist(liveAccount.accountId, lastSeenId, chatId, maxId, log);
       return;
     }
   } else {
@@ -1389,7 +1476,7 @@ async function processUnreadChat(
         }
         log?.info?.(`[wechat:${liveAccount.accountId}] Buffered ${processed.length} msg(s) for group history in ${chatId}`);
         const maxId = Math.max(...newMessages.map((m) => m.localId));
-        lastSeenId.set(chatId, maxId);
+        await setLastSeenAndPersist(liveAccount.accountId, lastSeenId, chatId, maxId, log);
         return;
       }
 
@@ -1434,6 +1521,7 @@ async function processUnreadChat(
   }
 
   // Split into segments at media boundaries and dispatch each
+  let allDispatched = true;
   if (processed.length > 0) {
     const segments = hasControlCommandInWindow
       ? processed.map((pm) => [pm])
@@ -1441,7 +1529,6 @@ async function processUnreadChat(
     log?.info?.(
       `[wechat:${liveAccount.accountId}] ${chatId}: ${processed.length} dispatchable msg(s) in ${segments.length} segment(s)`,
     );
-    let allDispatched = true;
     for (let i = 0; i < segments.length; i++) {
       const remaining = segments.length - i - 1;
       const dispatched = await dispatchSegment(
@@ -1466,7 +1553,17 @@ async function processUnreadChat(
     }
   }
 
-  // Update lastSeenId (track all messages including self-sent/filtered)
-  const maxId = Math.max(...newMessages.map((m) => m.localId));
-  lastSeenId.set(chatId, maxId);
+  // Only advance lastSeenId when every segment landed. If any send failed,
+  // leave it where it was so the next catch-up poll retries this batch —
+  // the alternative ("Queue end" + silent loss) is the bug we're fixing.
+  // processed.length === 0 (e.g. all messages self-sent / filtered) keeps
+  // allDispatched=true, so we still advance past those.
+  if (allDispatched) {
+    const maxId = Math.max(...newMessages.map((m) => m.localId));
+    await setLastSeenAndPersist(liveAccount.accountId, lastSeenId, chatId, maxId, log);
+  } else {
+    log?.info?.(
+      `[wechat:${liveAccount.accountId}] ${chatId}: keeping lastSeenId=${prevLastSeen} (some segments failed; will retry on next poll)`,
+    );
+  }
 }
