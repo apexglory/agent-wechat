@@ -505,6 +505,11 @@ export async function startWeChatMonitor(
             if (trimmed.startsWith("Image") && trimmed.length < 20) continue;
             if (trimmed.startsWith("[Red packet")) continue;
             if (trimmed.startsWith("￥")) continue;
+            // Location share (msgType=48): the a11y label is just "Location"
+            // + POI name + address, losing the lat/lng/scale in the real XML
+            // payload. Skip here so the DB catch-up picks up the full <msg>
+            // <location x=... y=... .../></msg> blob.
+            if (trimmed.startsWith("Location")) continue;
             eligible.push({ trimmed, norm: normalizeBubbleText(trimmed) });
           }
           if (eligible.length === 0) continue;
