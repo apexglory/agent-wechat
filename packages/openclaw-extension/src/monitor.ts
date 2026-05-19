@@ -17,6 +17,7 @@ import {
 } from "./access-control.js";
 import {
   isAutomationIgnoredChatId,
+  isAutomationIgnoredChatName,
   requiresChatOpenForMessages,
 } from "./automation-filter.js";
 import { runSerializedWeChatOperation } from "./operation-queue.ts";
@@ -553,6 +554,7 @@ export async function startWeChatMonitor(
 
         for (const unreadChat of a11yState.chatsWithUnread) {
           if (abortSignal.aborted) break;
+          if (isAutomationIgnoredChatName(unreadChat.name)) continue;
           if (ignoredNames.has(unreadChat.name)) continue; // silent: group/official/system
           if (!unreadChat.open) {
             log?.info?.(

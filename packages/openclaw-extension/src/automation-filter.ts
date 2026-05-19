@@ -22,8 +22,21 @@ const SYSTEM_CHAT_IDS = new Set([
   "brandservicesessionholder",
 ]);
 
+const SYSTEM_CHAT_DISPLAY_NAMES = new Set([
+  "Service Accounts",
+  "Subscriptions",
+  "WeChat Team",
+  "服务通知",
+  "订阅号消息",
+  "微信团队",
+]);
+
 export function isAutomationIgnoredChatId(chatId: string): boolean {
   return chatId.startsWith("gh_") || SYSTEM_CHAT_IDS.has(chatId);
+}
+
+export function isAutomationIgnoredChatName(chatName: string): boolean {
+  return SYSTEM_CHAT_DISPLAY_NAMES.has(chatName.trim());
 }
 
 export function canProcessMessageWithoutOpening(msg: Pick<Message, "kind">): boolean {

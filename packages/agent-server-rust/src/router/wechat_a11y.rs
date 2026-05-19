@@ -40,6 +40,18 @@ pub struct A11yMessage {
     pub bounds: Option<Bounds>,
 }
 
+fn is_auto_open_denied_chat_name(chat_name: &str) -> bool {
+    matches!(
+        chat_name.trim(),
+        "Service Accounts"
+            | "Subscriptions"
+            | "WeChat Team"
+            | "服务通知"
+            | "订阅号消息"
+            | "微信团队"
+    )
+}
+
 pub async fn a11y_state(Query(params): Query<A11yStateParams>) -> Json<Value> {
     // Limit the a11y dump to the wechat application subtree only (≈2× faster
     // than walking the whole desktop, which contains dbus / fluxbox / etc.).
@@ -103,7 +115,7 @@ pub async fn a11y_state(Query(params): Query<A11yStateParams>) -> Json<Value> {
                 let is_open = open_frames.iter().any(|f| f == &chat_name);
                 let bounds = item.bounds.clone();
 
-                if params.auto_open && !is_open {
+                if params.auto_open && !is_open && !is_auto_open_denied_chat_name(&chat_name) {
                     if let Some(b) = &bounds {
                         let cx = b.x + b.width / 2.0;
                         let cy = b.y + b.height / 2.0;
@@ -288,4 +300,24 @@ fn collect_top_level_frames(app: &A11yNode) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_auto_open_denied_chat_name;
+
+    #[test]
+    fn denies_system_aggregate_chat_names() {
+        assert!(is_auto_open_denied_chat_name("Service Accounts"));
+        assert!(is_auto_open_denied_chat_name("Subscriptions"));
+        assert!(is_auto_open_denied_chat_name("服务通知"));
+        assert!(is_auto_open_denied_chat_name("订阅号消息"));
+        assert!(is_auto_open_denied_chat_name(" 微信团队 "));
+    }
+
+    #[test]
+    fn allows_regular_chat_names() {
+        assert!(!is_auto_open_denied_chat_name("Alice"));
+        assert!(!is_auto_open_denied_chat_name("Project Group"));
+    }
 }
