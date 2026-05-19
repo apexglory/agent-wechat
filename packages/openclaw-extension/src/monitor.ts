@@ -123,6 +123,7 @@ async function setLastSeenAndPersist(
 type RecentEntry = { text: string; ts: number };
 const A11Y_DEDUP_WINDOW_MS = 1_800_000;  // 30 min — recentlySentReplies safety net
 const A11Y_DB_RACE_WINDOW_MS = 30_000;   // 30 s  — fast-path→DB catch-up race window
+const A11Y_PENDING_SEND_WINDOW_MS = 15_000; // 15 s — defer fast-path on marker miss after a recent send
 
 const recentlySentReplies = new Map<string, RecentEntry[]>();   // wxid -> normalized outbound texts (dedup bot's own)
 const a11yDispatchedContent = new Map<string, RecentEntry[]>(); // wxid -> normalized contents already dispatched via a11y
@@ -606,6 +607,7 @@ export async function startWeChatMonitor(
           const bottomMarker = a11yChatBottom.get(wxid);
           let candidates: Array<{ trimmed: string; norm: string }>;
           let markerFound = false;
+          let deferredForPendingSend = false;
           if (bottomMarker) {
             let idx = -1;
             for (let i = eligible.length - 1; i >= 0; i--) {
@@ -618,21 +620,44 @@ export async function startWeChatMonitor(
               candidates = eligible.slice(idx + 1);
               markerFound = true;
             } else {
-              // Marker scrolled off (chat scrolled, bot restart, etc.):
-              // fall back to the unread-badge slice. Conservative — may
-              // re-dispatch a small window once, then the marker reseats.
-              candidates = eligible.slice(-unreadChat.unread);
+              // Marker not in eligible. Two reasons to be careful before
+              // falling back to slice(-unread):
+              //   (a) chat scrolled / restart — marker truly stale → fallback
+              //   (b) send just completed and the bubble hasn't rendered in
+              //       a11y yet → fallback would RE-DISPATCH the inbound msg
+              //       that triggered the send (saw this 2026-05-19 20:06:39:
+              //       Queue end 20:06:38.604, fast-path 511ms later, marker
+              //       points to bot's not-yet-rendered reply, missed → fell
+              //       back → second dispatch of "有啥料可以加").
+              // Distinguish via recentlySentReplies: if anything's been sent
+              // in the last A11Y_PENDING_SEND_WINDOW_MS, treat as (b) and
+              // DEFER (skip this poll, leave marker as-is so next poll picks
+              // up the bubble when it renders).
+              const cutoff = Date.now() - A11Y_PENDING_SEND_WINDOW_MS;
+              const pendingArr = recentlySentReplies.get(wxid);
+              const pendingSend = pendingArr?.some((e) => e.ts >= cutoff) ?? false;
+              if (pendingSend) {
+                log?.info?.(
+                  `[wechat:${account.accountId}] a11y fast-path defer ${unreadChat.name}: marker miss but recent send within ${A11Y_PENDING_SEND_WINDOW_MS / 1000}s; bubble likely still rendering`,
+                );
+                candidates = [];
+                deferredForPendingSend = true;
+              } else {
+                candidates = eligible.slice(-unreadChat.unread);
+              }
             }
           } else {
             // First observation for this chat — trust the unread badge.
             candidates = eligible.slice(-unreadChat.unread);
           }
 
-          // Always reseat the marker to the current bottom-most eligible
-          // bubble, regardless of whether anything got dispatched. This is
-          // what stops repeat dispatches at the 2-min TTL boundary.
-          const lastEligible = eligible[eligible.length - 1];
-          a11yChatBottom.set(wxid, lastEligible.norm);
+          // Reseat the marker to the current bottom-most eligible bubble.
+          // Skip on defer so the bot-reply-text marker remains and the next
+          // poll (which should see the rendered bubble) can find it.
+          if (!deferredForPendingSend) {
+            const lastEligible = eligible[eligible.length - 1];
+            a11yChatBottom.set(wxid, lastEligible.norm);
+          }
 
           for (const item of candidates) {
             // Defense-in-depth: bot's own reply, in case the send path's
