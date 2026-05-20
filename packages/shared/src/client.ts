@@ -273,11 +273,22 @@ export class WeChatClient {
   async wechatA11yState(opts?: {
     autoOpen?: boolean;
     includeMessages?: boolean;
+    /**
+     * Display names whose auto-open should be skipped on top of the Rust
+     * side's hardcoded denylist. Used to project wxid-based rules (e.g.
+     * "any wxid that starts with `gh_`") into the a11y layer, which only
+     * knows chat names.
+     */
+    autoOpenSkipNames?: string[];
   }): Promise<A11yState> {
     return this.get(
       `/api/wechat/a11y_state${qs({
         autoOpen: opts?.autoOpen,
         includeMessages: opts?.includeMessages,
+        autoOpenSkipNames:
+          opts?.autoOpenSkipNames && opts.autoOpenSkipNames.length > 0
+            ? JSON.stringify(opts.autoOpenSkipNames)
+            : undefined,
       })}`,
     );
   }

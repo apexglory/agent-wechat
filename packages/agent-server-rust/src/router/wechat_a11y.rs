@@ -13,6 +13,20 @@ pub struct A11yStateParams {
     auto_open: bool,
     #[serde(default = "default_include_messages", rename = "includeMessages")]
     include_messages: bool,
+    /// Optional JSON-encoded array of chat display names whose auto-open
+    /// should be skipped on top of the hardcoded denylist. The TS extension
+    /// uses this to project wxid-based rules (e.g. anything starting with
+    /// `gh_`) down to the Rust side, which only sees display names from the
+    /// a11y tree and can't apply wxid rules on its own.
+    #[serde(default, rename = "autoOpenSkipNames")]
+    auto_open_skip_names: Option<String>,
+}
+
+fn parse_auto_open_skip_names(raw: &Option<String>) -> Vec<String> {
+    raw.as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .map(|v| v.into_iter().map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default()
 }
 
 fn default_include_messages() -> bool {
@@ -53,6 +67,7 @@ fn is_auto_open_denied_chat_name(chat_name: &str) -> bool {
 }
 
 pub async fn a11y_state(Query(params): Query<A11yStateParams>) -> Json<Value> {
+    let extra_skip_names = parse_auto_open_skip_names(&params.auto_open_skip_names);
     // Limit the a11y dump to the wechat application subtree only (≈2× faster
     // than walking the whole desktop, which contains dbus / fluxbox / etc.).
     let tree = match get_a11y_app("wechat", &ExecOptions::default()).await {
@@ -115,7 +130,11 @@ pub async fn a11y_state(Query(params): Query<A11yStateParams>) -> Json<Value> {
                 let is_open = open_frames.iter().any(|f| f == &chat_name);
                 let bounds = item.bounds.clone();
 
-                if params.auto_open && !is_open && !is_auto_open_denied_chat_name(&chat_name) {
+                if params.auto_open
+                    && !is_open
+                    && !is_auto_open_denied_chat_name(&chat_name)
+                    && !extra_skip_names.iter().any(|n| n == &chat_name)
+                {
                     if let Some(b) = &bounds {
                         let cx = b.x + b.width / 2.0;
                         let cy = b.y + b.height / 2.0;
@@ -304,7 +323,7 @@ fn collect_top_level_frames(app: &A11yNode) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_auto_open_denied_chat_name;
+    use super::{is_auto_open_denied_chat_name, parse_auto_open_skip_names};
 
     #[test]
     fn denies_system_aggregate_chat_names() {
@@ -319,5 +338,31 @@ mod tests {
     fn allows_regular_chat_names() {
         assert!(!is_auto_open_denied_chat_name("Alice"));
         assert!(!is_auto_open_denied_chat_name("Project Group"));
+    }
+
+    #[test]
+    fn parses_skip_names_json_array() {
+        let raw = Some(r#"["你好世界科技有限公司","Tencent News"]"#.to_string());
+        let parsed = parse_auto_open_skip_names(&raw);
+        assert_eq!(
+            parsed,
+            vec![
+                "你好世界科技有限公司".to_string(),
+                "Tencent News".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_skip_names_trims_whitespace() {
+        let raw = Some(r#"["  Alice  "]"#.to_string());
+        assert_eq!(parse_auto_open_skip_names(&raw), vec!["Alice".to_string()]);
+    }
+
+    #[test]
+    fn parses_skip_names_missing_or_invalid_yields_empty() {
+        assert!(parse_auto_open_skip_names(&None).is_empty());
+        assert!(parse_auto_open_skip_names(&Some("not json".to_string())).is_empty());
+        assert!(parse_auto_open_skip_names(&Some("{}".to_string())).is_empty());
     }
 }

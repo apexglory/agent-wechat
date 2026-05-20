@@ -476,6 +476,32 @@ export async function startWeChatMonitor(
         }
       }
 
+      // ---- Message polling ----
+      // listChats first so we can project wxid-based ignore rules (e.g.
+      // anything starting with `gh_`) into a display-name deny list for
+      // the a11y probe below — the Rust auto-open path only sees display
+      // names from the a11y tree and would otherwise click a `gh_*` chat
+      // open before the TS-side wxid filter ever runs (which has caused
+      // wechat to disconnect on some official-account windows).
+      let chats: Chat[];
+      try {
+        chats = await client.listChats(50);
+      } catch (err) {
+        log?.error?.(
+          `[wechat:${account.accountId}] Failed to list chats: ${err}`,
+        );
+        await sleep(account.pollIntervalMs, abortSignal);
+        continue;
+      }
+
+      const autoOpenSkipNames: string[] = [];
+      for (const c of chats) {
+        const wxid = c.username ?? c.id;
+        if (!wxid || !c.name) continue;
+        if (wxid.includes("@chatroom")) continue;
+        if (isAutomationIgnoredChatId(wxid)) autoOpenSkipNames.push(c.name);
+      }
+
       // ---- A11y fast-path probe ----
       // Triggers auto-double-click on any chat that has an unread badge in
       // the main window but no independent frame yet, then (for already-open
@@ -487,6 +513,7 @@ export async function startWeChatMonitor(
         a11yState = await client.wechatA11yState({
           autoOpen: true,
           includeMessages: true,
+          autoOpenSkipNames,
         });
         if (a11yState.error) {
           log?.info?.(
@@ -502,18 +529,6 @@ export async function startWeChatMonitor(
         log?.info?.(
           `[wechat:${account.accountId}] a11y_state failed: ${err} (${Date.now() - a11yT0}ms)`,
         );
-      }
-
-      // ---- Message polling ----
-      let chats: Chat[];
-      try {
-        chats = await client.listChats(50);
-      } catch (err) {
-        log?.error?.(
-          `[wechat:${account.accountId}] Failed to list chats: ${err}`,
-        );
-        await sleep(account.pollIntervalMs, abortSignal);
-        continue;
       }
 
       // ---- A11y fast-path dispatch (DM text only, phase 1) ----
