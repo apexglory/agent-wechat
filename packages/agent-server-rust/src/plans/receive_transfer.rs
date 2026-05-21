@@ -39,6 +39,7 @@ pub struct ReceiveTransferPlanState {
     pub receive_attempts: u32,
     pub success_attempts: u32,
     pub close_attempts: u32,
+    pub reopen_attempts: u32,
     pub received: bool,
 }
 
@@ -233,6 +234,7 @@ impl Plan for ReceiveTransferPlan {
             receive_attempts: 0,
             success_attempts: 0,
             close_attempts: 0,
+            reopen_attempts: 0,
             received: false,
         }
     }
@@ -294,7 +296,10 @@ impl Plan for ReceiveTransferPlan {
                         })
                     });
 
-                    let force = main_state_id == Some("chat");
+                    // Force a real re-select when we looped back here from the
+                    // wrong-chat guard, so chat-select can't skip on a stale
+                    // "already selected" belief and leave us on the wrong chat.
+                    let force = main_state_id == Some("chat") || plan_state.reopen_attempts > 0;
                     let result = open_chat(&params.chat_id, force, click_xy).await;
 
                     if !result.ok {
@@ -320,6 +325,37 @@ impl Plan for ReceiveTransferPlan {
                 ReceiveTransferPhase::ClickingTransfer => {
                     if main_state_id != Some("chat_open") {
                         return None;
+                    }
+
+                    // Guard against chat-select landing on the wrong conversation.
+                    // chat-select switches chats by hooking selectSession and rewriting
+                    // the session index; if that index is stale or mis-mapped it can open
+                    // a different chat while still reporting ok. Without this check we'd
+                    // scroll the wrong chat's history until find_attempts is exhausted and
+                    // fail with a meaningless "No action selected" — and, worse, never
+                    // surface that the receive ran against the wrong chat.
+                    if let Some(opened) = state.main_window.opened_chat_username.as_deref() {
+                        if opened != params.chat_id {
+                            if plan_state.reopen_attempts >= 3 {
+                                tracing::warn!(
+                                    "[receive_transfer] opened wrong chat: expected {}, got {}; giving up after {} reopen attempts",
+                                    params.chat_id,
+                                    opened,
+                                    plan_state.reopen_attempts
+                                );
+                                return None;
+                            }
+                            tracing::warn!(
+                                "[receive_transfer] opened wrong chat: expected {}, got {}; reopening (attempt {})",
+                                params.chat_id,
+                                opened,
+                                plan_state.reopen_attempts + 1
+                            );
+                            plan_state.reopen_attempts += 1;
+                            plan_state.find_attempts = 0;
+                            plan_state.phase = ReceiveTransferPhase::OpeningChat;
+                            continue;
+                        }
                     }
 
                     let transfer_node = find_transfer_message(a11y, params.amount_text.as_deref());
