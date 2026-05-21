@@ -118,6 +118,7 @@ pub async fn auth_status() -> Json<serde_json::Value> {
 
 /// Log out of WeChat via FSM execution loop.
 pub async fn logout() -> Json<serde_json::Value> {
+    let _ui_guard = crate::ui_mutex::lock().await;
     let session = match get_session("default") {
         Some(s) => s,
         None => {
@@ -193,6 +194,7 @@ pub async fn logout() -> Json<serde_json::Value> {
 }
 
 pub async fn login() -> Json<serde_json::Value> {
+    let _ui_guard = crate::ui_mutex::lock().await;
     let screenshot = capture_screenshot(&ExecOptions::default()).await;
 
     match screenshot {
@@ -238,6 +240,7 @@ pub async fn login_ws(
 }
 
 async fn handle_login_ws(mut socket: WebSocket, params: LoginWsParams) {
+    let _ui_guard = crate::ui_mutex::lock().await;
     let session = match get_session("default") {
         Some(s) => s,
         None => {

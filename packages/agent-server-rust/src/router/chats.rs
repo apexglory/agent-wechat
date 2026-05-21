@@ -167,6 +167,7 @@ pub async fn open_chat(
     Path(chat_id): Path<String>,
     Query(params): Query<OpenChatParams>,
 ) -> Json<serde_json::Value> {
+    let _ui_guard = crate::ui_mutex::lock().await;
     let clear_unreads = params.clear_unreads;
     let session = match get_session("default") {
         Some(s) => s,

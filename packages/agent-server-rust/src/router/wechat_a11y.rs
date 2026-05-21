@@ -189,31 +189,38 @@ pub async fn a11y_state(Query(params): Query<A11yStateParams>) -> Json<Value> {
 
     let mut opened: Vec<String> = Vec::new();
     let mut open_errors: Vec<Value> = Vec::new();
-    for (chat, cx, cy) in chats_to_open {
-        let opts = ExecOptions::default();
-        let x = (cx as i32).to_string();
-        let y = (cy as i32).to_string();
-        let args = [
-            "mousemove",
-            "--sync",
-            &x,
-            &y,
-            "click",
-            "--repeat",
-            "2",
-            "--delay",
-            "100",
-            "1",
-        ];
-        let res = exec_command("xdotool", &args, &opts).await;
-        if res.exit_code == 0 {
-            opened.push(chat);
-        } else {
-            open_errors.push(json!({
-                "chat": chat,
-                "exitCode": res.exit_code,
-                "stderr": res.stderr,
-            }));
+    if !chats_to_open.is_empty() {
+        // Serialize the autoOpen clicks against any in-flight SendMessagePlan
+        // / receive_transfer / open_chat FSM. The a11y snapshot above is
+        // read-only and intentionally NOT under the lock so concurrent
+        // status / messages-list queries stay responsive.
+        let _ui_guard = crate::ui_mutex::lock().await;
+        for (chat, cx, cy) in chats_to_open {
+            let opts = ExecOptions::default();
+            let x = (cx as i32).to_string();
+            let y = (cy as i32).to_string();
+            let args = [
+                "mousemove",
+                "--sync",
+                &x,
+                &y,
+                "click",
+                "--repeat",
+                "2",
+                "--delay",
+                "100",
+                "1",
+            ];
+            let res = exec_command("xdotool", &args, &opts).await;
+            if res.exit_code == 0 {
+                opened.push(chat);
+            } else {
+                open_errors.push(json!({
+                    "chat": chat,
+                    "exitCode": res.exit_code,
+                    "stderr": res.stderr,
+                }));
+            }
         }
     }
 

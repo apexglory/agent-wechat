@@ -190,6 +190,9 @@ pub struct SendFastParams {
 }
 
 pub async fn send_fast(Json(input): Json<SendFastParams>) -> Json<serde_json::Value> {
+    // send_fast still drives xdotool against the live wechat window — keep
+    // the UI mutex coverage symmetric with send_message and the FSM plans.
+    let _ui_guard = crate::ui_mutex::lock().await;
     let session = get_session("default");
     let exec_opts = ExecOptions {
         session: session.map(|s| s.clone()),
@@ -222,6 +225,10 @@ pub async fn send_message(Json(input): Json<SendParams>) -> Json<SendResult> {
             error: Some("No text, image, or file provided".to_string()),
         });
     }
+
+    // Serialize UI access — concurrent xdotool clicks from autoOpen / other
+    // routes will otherwise drop SendMessagePlan into "No action selected".
+    let _ui_guard = crate::ui_mutex::lock().await;
 
     let session = match get_session("default") {
         Some(s) => s,
@@ -653,6 +660,7 @@ pub async fn receive_transfer(
     Path(chat_id): Path<String>,
     Json(input): Json<ReceiveTransferInput>,
 ) -> Json<ReceivePaymentResult> {
+    let _ui_guard = crate::ui_mutex::lock().await;
     let (session, logged_in_user, keys) = match load_logged_in_session_and_keys().await {
         Ok(value) => value,
         Err(result) => return Json(result),
@@ -810,6 +818,7 @@ pub async fn receive_red_packet(
     Path(chat_id): Path<String>,
     Json(input): Json<ReceiveRedPacketInput>,
 ) -> Json<ReceivePaymentResult> {
+    let _ui_guard = crate::ui_mutex::lock().await;
     let (session, logged_in_user, keys) = match load_logged_in_session_and_keys().await {
         Ok(value) => value,
         Err(result) => return Json(result),

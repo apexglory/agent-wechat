@@ -9,6 +9,7 @@ mod plans;
 mod router;
 mod sessions;
 mod tools;
+mod ui_mutex;
 
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
