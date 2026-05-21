@@ -938,31 +938,29 @@ async function prepareMessagesForChat(
 }
 
 /**
- * Split processed messages into batches where each batch has at most one media message.
- * When a second media is encountered, flush the current batch and start a new one.
+ * One segment per processed message — every inbound message gets its own LLM
+ * turn.
+ *
+ * Used to fold multiple consecutive messages into a single batch where only
+ * the trailing message got CURRENT_MESSAGE_MARKER and the earlier ones got
+ * HISTORY_CONTEXT_MARKER. The SOP treats history as untrusted (defense against
+ * group/quote/forward-injected write intents), so anything actionable in the
+ * earlier messages was silently dropped. Saw this 2026-05-21 on qiafan-bot:
+ * customer service sent "021840... 已下单 21元" then "164770... 接单" 12s
+ * apart; the first message's write intent was lost and the order's
+ * external_paid_amount_cent stayed 0.
+ *
+ * One-per-segment trade-offs:
+ * - Group chat is explicitly out of scope (DMs only), so we don't need
+ *   batching for "user typed three lines in a row".
+ * - Consecutive identical bubbles are already filtered at the a11y marker
+ *   layer before they reach this function, so a "在么/在么/在么" burst still
+ *   only triggers one LLM call.
+ * - Image + caption arrives as a single Message object with both media and
+ *   text — no segment-level batching needed for that case.
  */
 function buildSegments(processed: ProcessedMessage[]): ProcessedMessage[][] {
-  const segments: ProcessedMessage[][] = [];
-  let currentBatch: ProcessedMessage[] = [];
-  let mediaCount = 0;
-
-  for (const pm of processed) {
-    if (pm.hasMedia && mediaCount >= 1) {
-      // Second media in this batch — flush and start new batch
-      segments.push(currentBatch);
-      currentBatch = [pm];
-      mediaCount = 1;
-    } else {
-      if (pm.hasMedia) mediaCount++;
-      currentBatch.push(pm);
-    }
-  }
-
-  if (currentBatch.length > 0) {
-    segments.push(currentBatch);
-  }
-
-  return segments;
+  return processed.map((pm) => [pm]);
 }
 
 /**
