@@ -11,6 +11,7 @@ test("isAutomationIgnoredChatId filters system and official chats", () => {
   assert.equal(isAutomationIgnoredChatId("newsapp"), true);
   assert.equal(isAutomationIgnoredChatId("gh_78dc74638eaa"), true);
   assert.equal(isAutomationIgnoredChatId("brandservicesessionholder"), true);
+  assert.equal(isAutomationIgnoredChatId("brandsessionholder"), true);
   assert.equal(isAutomationIgnoredChatId("wxid_123"), false);
   assert.equal(isAutomationIgnoredChatId("room@chatroom"), false);
 });

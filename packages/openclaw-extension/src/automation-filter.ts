@@ -20,6 +20,12 @@ const SYSTEM_CHAT_IDS = new Set([
   "lbsapp",
   "pc_qq",
   "brandservicesessionholder",
+  // Sibling of brandservicesessionholder — same role (system aggregate
+  // placeholder) but appears under this username on some WeChat builds.
+  // Observed on qiafan-bot 2026-05-21 as a permanent-unread chat whose
+  // listMessages always returns 0 rows; without the deny entry the catch-up
+  // loop fires every poll forever.
+  "brandsessionholder",
 ]);
 
 const SYSTEM_CHAT_DISPLAY_NAMES = new Set([

@@ -1372,7 +1372,28 @@ async function processUnreadChat(
     `[wechat:${liveAccount.accountId}] ${chatId}: fetched ${messages.length} msgs, firstPoll=${firstPoll}, prevLastSeen=${prevLastSeen}, unreadCount=${chat.unreadCount}`,
   );
 
-  if (messages.length === 0) return;
+  if (messages.length === 0) {
+    // listMessages returned nothing even though session.db's lastMsgLocalId
+    // is ahead of our lastSeenId (that's the precondition for catch-up
+    // firing). Some system/placeholder chats (e.g. brandsessionholder) sit
+    // in this state permanently — without advancing lastSeenId here, the
+    // catch-up loop re-fires every pollIntervalMs (500ms), thrashing
+    // agent-server with listChats/listMessages/wechatA11yState and turning
+    // the autoOpen xdotool click into a constant background storm that
+    // races with concurrent SendMessagePlan FSMs. Move lastSeenId up to the
+    // session.db tip so the chat stays quiet until WCDB reports a newer
+    // localId (i.e. a genuine new message).
+    if (chat.lastMsgLocalId && chat.lastMsgLocalId > prevLastSeen) {
+      await setLastSeenAndPersist(
+        liveAccount.accountId,
+        lastSeenId,
+        chatId,
+        chat.lastMsgLocalId,
+        log,
+      );
+    }
+    return;
+  }
 
   // On first poll, only process the last `unreadCount` messages
   // and seed lastSeenId from the rest
