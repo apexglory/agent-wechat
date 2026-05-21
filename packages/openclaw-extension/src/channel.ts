@@ -15,6 +15,7 @@ import {
 } from "./agent-tools.js";
 import { normalizeWeChatCommandBody, normalizeWeChatId } from "./access-control.js";
 import { runSerializedWeChatOperation } from "./operation-queue.ts";
+import { noteOutboundText } from "./a11y-echo-guard.ts";
 
 const meta: ChannelPlugin["meta"] = {
   id: "wechat",
@@ -185,6 +186,10 @@ export const wechatPlugin: ChannelPlugin<ResolvedWeChatAccount> = {
       if (!result.success) {
         throw new Error(result.error ?? "Send failed");
       }
+      // Reseat the a11y fast-path marker so the monitor doesn't read this
+      // bot reply back as a fresh inbound message (self-echo). The agent's
+      // replies arrive here, NOT through monitor.ts's inline reply path.
+      noteOutboundText(to, text);
       return {
         channel: "wechat" as const,
         messageId: `wechat:${to}:${Date.now()}`,
@@ -246,6 +251,9 @@ export const wechatPlugin: ChannelPlugin<ResolvedWeChatAccount> = {
         if (!result.success) {
           throw new Error(result.error ?? "Send media failed");
         }
+        // A media bubble carries no marker text, but a caption does — reseat
+        // it so the caption isn't echoed back as a fresh inbound message.
+        if (text) noteOutboundText(to, text);
         return {
           channel: "wechat" as const,
           messageId: `wechat:${to}:${Date.now()}`,
@@ -264,6 +272,7 @@ export const wechatPlugin: ChannelPlugin<ResolvedWeChatAccount> = {
       if (!result.success) {
         throw new Error(result.error ?? "Send failed");
       }
+      if (text) noteOutboundText(to, text);
       return {
         channel: "wechat" as const,
         messageId: `wechat:${to}:${Date.now()}`,

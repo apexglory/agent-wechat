@@ -21,6 +21,20 @@ import {
   requiresChatOpenForMessages,
 } from "./automation-filter.js";
 import { runSerializedWeChatOperation } from "./operation-queue.ts";
+import {
+  A11Y_DB_RACE_WINDOW_MS,
+  A11Y_PENDING_SEND_WINDOW_MS,
+  a11yChatBottom,
+  a11yDispatchedContent,
+  bubblesMatch,
+  cleanupRecent,
+  consumeRecent,
+  normalizeBubbleText,
+  noteOutboundText,
+  recentContains,
+  recentlySentReplies,
+  recordRecent,
+} from "./a11y-echo-guard.ts";
 import { formatPaymentBody } from "./payment-format.js";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
@@ -99,55 +113,10 @@ async function setLastSeenAndPersist(
   }
 }
 
-// ============================================================
-// A11y fast-path state (module-level, shared across accounts)
-//
-// WeChat's a11y tree collapses every chat bubble to a single list-item
-// with text in `name` and no children/states — so inbound vs outbound
-// is invisible at this layer. Instead we track the bottom-most visible
-// bubble per chat as a high-water mark: items below the marker are new,
-// items at-or-above are already-seen (including bot's own replies).
-// The send path updates the marker as soon as the bot delivers a reply,
-// so its own bubble can never be misread as a new inbound message.
-//
-// Dedup ringbuffers (defense-in-depth, NOT the primary new-vs-old judge):
-//   recentlySentReplies     — bot outbound texts, guards against echo of bot
-//                             bubbles in case the marker fails to update.
-//   a11yDispatchedContent   — texts dispatched via fast-path, used ONLY by
-//                             the DB catch-up loop to skip the ~9s race
-//                             between fast-path dispatch and WCDB flush.
-// The marker is the sole "is this a new message" judge — repeating-text
-// dedup at content level is intentionally NOT applied in fast-path itself,
-// otherwise legitimate user repeats like "2" → bot reply → "2" get killed.
-// ============================================================
-type RecentEntry = { text: string; ts: number };
-const A11Y_DEDUP_WINDOW_MS = 1_800_000;  // 30 min — recentlySentReplies safety net
-const A11Y_DB_RACE_WINDOW_MS = 30_000;   // 30 s  — fast-path→DB catch-up race window
-const A11Y_PENDING_SEND_WINDOW_MS = 15_000; // 15 s — defer fast-path on marker miss after a recent send
-
-const recentlySentReplies = new Map<string, RecentEntry[]>();   // wxid -> normalized outbound texts (dedup bot's own)
-const a11yDispatchedContent = new Map<string, RecentEntry[]>(); // wxid -> normalized contents already dispatched via a11y
-// Per-chat normalized text of the most recent visible bubble (bot's reply OR last dispatch).
-// Items appearing below this marker on the next poll are the only candidates for dispatch.
-const a11yChatBottom = new Map<string, string>();
-
-function normalizeBubbleText(s: string): string {
-  // WeChat tends to append "\n " to bubble labels; long bubbles are also
-  // truncated in atspi. Collapse runs of whitespace to a single space so
-  // recordings and a11y reads compare consistently.
-  return s.replace(/\s+/g, " ").trim();
-}
-
-function bubblesMatch(a: string, b: string): boolean {
-  // Both inputs already normalized.
-  if (a === b) return true;
-  // a11y may truncate long bubbles. If either is a prefix of the other
-  // (and not trivially short), treat as the same bubble.
-  if (a.length >= 12 && b.length >= 12) {
-    if (a.startsWith(b) || b.startsWith(a)) return true;
-  }
-  return false;
-}
+// A11y fast-path echo-guard state (markers + dedup rings) lives in its own
+// module so EVERY outbound text path can reseat it — including OpenClaw's async
+// outbound adapter in channel.ts, which delivers the agent's replies and is a
+// separate code path from the inline reply below. See a11y-echo-guard.ts.
 
 // Unique negative localId per a11y-dispatched message, so openclaw's
 // inbound MessageSid dedup (wechat:<chat>:<localId>) doesn't collapse
@@ -164,33 +133,6 @@ function nextA11yLocalId(): number {
 const A11Y_TIMESTAMP_ROW_RE = /^\d{1,2}:\d{2}(?::\d{2})?$/;
 const A11Y_MEDIA_TAG_RE = /\[(?:Image|Audio|Video|File|Transfer|Red\s*packet)/i;
 const A11Y_AUDIO_NAME_RE = /^Audio\d+/i;
-
-function cleanupRecent(map: Map<string, RecentEntry[]>): void {
-  const cutoff = Date.now() - A11Y_DEDUP_WINDOW_MS;
-  for (const [k, arr] of map.entries()) {
-    const fresh = arr.filter((e) => e.ts >= cutoff);
-    if (fresh.length === 0) map.delete(k);
-    else map.set(k, fresh);
-  }
-}
-
-function recordRecent(map: Map<string, RecentEntry[]>, key: string, text: string): void {
-  const arr = map.get(key) ?? [];
-  arr.push({ text, ts: Date.now() });
-  map.set(key, arr);
-}
-
-function recentContains(
-  map: Map<string, RecentEntry[]>,
-  key: string,
-  text: string,
-  windowMs: number = A11Y_DEDUP_WINDOW_MS,
-): boolean {
-  const arr = map.get(key);
-  if (!arr) return false;
-  const cutoff = Date.now() - windowMs;
-  return arr.some((e) => e.ts >= cutoff && bubblesMatch(e.text, text));
-}
 
 // History context markers (match openclaw's built-in markers)
 const HISTORY_CONTEXT_MARKER = "[Chat messages since your last reply - for context]";
@@ -817,13 +759,15 @@ async function prepareMessage(
     return null;
   }
 
-  // Skip if already dispatched via a11y fast path within the WCDB flush
-  // race window (~9s). Using a short window — not the long safety-net TTL —
-  // so that a user who legitimately repeats the same text minutes later
-  // doesn't get silently dropped here.
+  // Skip if already dispatched via a11y fast path. consumeRecent removes the
+  // matched entry so it suppresses exactly ONE WCDB row — a user who later
+  // repeats the same text isn't silently dropped (the repeat finds no entry
+  // and dispatches). The window is generous (minutes) because WCDB's batched
+  // flush can lag well past the old 30s window (observed 44s), which is what
+  // double-dispatched the message before this fix.
   if (msg.kind === "text" && msg.content) {
     if (
-      recentContains(
+      consumeRecent(
         a11yDispatchedContent,
         chatId,
         normalizeBubbleText(msg.content),
@@ -1315,17 +1259,13 @@ async function dispatchSegment(
                 // Send text caption separately if present
                 if (text) {
                   await sendTextWithFastFallback(client, chat, chatId, text, log);
-                  const norm = normalizeBubbleText(text);
-                  recordRecent(recentlySentReplies, chatId, norm);
                   // Reseat the fast-path marker on the bot's own bubble so
                   // the next a11y poll won't read it as a new inbound msg.
-                  a11yChatBottom.set(chatId, norm);
+                  noteOutboundText(chatId, text);
                 }
               } else if (text) {
                 await sendTextWithFastFallback(client, chat, chatId, text, log);
-                const norm = normalizeBubbleText(text);
-                recordRecent(recentlySentReplies, chatId, norm);
-                a11yChatBottom.set(chatId, norm);
+                noteOutboundText(chatId, text);
               }
             },
             log,
