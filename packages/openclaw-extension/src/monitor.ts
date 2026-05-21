@@ -603,8 +603,29 @@ export async function startWeChatMonitor(
                 candidates = eligible.slice(-unreadChat.unread);
               }
             }
+          } else if (lastSeenId.has(wxid)) {
+            // We know this chat from a prior run (lastSeenId is on disk) but
+            // the in-memory a11yChatBottom map is empty — gateway just
+            // restarted. The visible bubbles include messages that were
+            // already dispatched before the restart, but fast-path has no
+            // way to tell them apart from genuinely new ones (the persisted
+            // signal is per-msg localId, the marker is per-bubble text).
+            // Skip dispatch this poll; the DB catch-up loop will fire for
+            // anything with localId > lastSeenId, which is what we want.
+            // Marker still gets reseated below so the NEXT poll runs the
+            // normal marker-hit path. Cost: one user message arriving
+            // mid-restart waits ~5–10s for DB flush instead of ~1s for
+            // fast-path. Saw the alternative on qiafan-bot 2026-05-21
+            // 17:34:11: restart at 17:33:58 → marker undefined → fallback
+            // slice(-unread) → re-dispatched "霸王茶姬都有啥" that the
+            // pre-restart catch-up had already handled.
+            log?.info?.(
+              `[wechat:${account.accountId}] a11y fast-path defer ${unreadChat.name}: post-restart cold-start (marker lost, lastSeenId persisted); DB catch-up will handle`,
+            );
+            candidates = [];
           } else {
-            // First observation for this chat — trust the unread badge.
+            // First observation for a chat we've never seen — trust the
+            // unread badge.
             candidates = eligible.slice(-unreadChat.unread);
           }
 
