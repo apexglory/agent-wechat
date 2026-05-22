@@ -245,9 +245,26 @@ async function dispatchA11yTextMessage(
   );
 }
 
+// A failed agent reply is NOT recovered by the catch-up loop: that loop only
+// re-processes inbound messages, while the generated reply text is discarded
+// once the turn ends (the inbound is already marked dispatched). So a single
+// transient send miss = a permanently lost reply. These misses are almost
+// always UI-automation hiccups (chat-select missed the target, window lost
+// focus mid-SendMessagePlan, xdotool couldn't find the frame) that clear by
+// the next attempt, so we retry in place before giving up.
+const SEND_MAX_ATTEMPTS = 3;
+const SEND_RETRY_DELAY_MS = 1500;
+
+/** Errors where retrying is pointless — fail fast instead of burning attempts. */
+function isFatalSendError(error: string | undefined): boolean {
+  if (!error) return false;
+  return /NOT_LOGGED_IN|No session available/i.test(error);
+}
+
 /**
  * Try the frame-aware fast send first (skips chat-select / send_message plan).
- * Falls back to the existing `sendMessage` HTTP route on any failure.
+ * Falls back to the existing `sendMessage` HTTP route on any failure, and
+ * retries the whole thing on transient failures (see SEND_MAX_ATTEMPTS above).
  * DM only for phase 1 — groups don't get standalone frames by display name.
  */
 async function sendTextWithFastFallback(
@@ -258,27 +275,36 @@ async function sendTextWithFastFallback(
   log?: { info?: (...args: any[]) => void; error?: (...args: any[]) => void },
 ): Promise<void> {
   const isGroup = chatId.includes("@chatroom");
-  if (!isGroup && chat.name) {
-    try {
-      const fast = await client.sendFast({ frameName: chat.name, text });
-      if (fast.ok) return;
+  let lastError = "unknown";
+  for (let attempt = 1; attempt <= SEND_MAX_ATTEMPTS; attempt++) {
+    if (!isGroup && chat.name) {
+      try {
+        const fast = await client.sendFast({ frameName: chat.name, text });
+        if (fast.ok) return;
+        log?.info?.(
+          `[wechat] sendFast skipped, falling back to sendMessage: ${fast.error ?? "unknown"}`,
+        );
+      } catch (err) {
+        log?.info?.(`[wechat] sendFast threw, falling back: ${err}`);
+      }
+    }
+    // Authoritative path: respect SendResult.success. Rust SendMessagePlan can
+    // return success=false (chat-select missed, send button never re-enabled,
+    // etc.) — re-running it re-does open_chat, which usually recovers on the
+    // next attempt. Only after exhausting attempts do we throw, so the outer
+    // pipeline still reports a genuinely undeliverable reply.
+    const result = await client.sendMessage({ chatId, text });
+    if (result.success) return;
+    lastError = result.error ?? "unknown";
+    if (isFatalSendError(lastError)) break;
+    if (attempt < SEND_MAX_ATTEMPTS) {
       log?.info?.(
-        `[wechat] sendFast skipped, falling back to sendMessage: ${fast.error ?? "unknown"}`,
+        `[wechat] sendMessage failed (attempt ${attempt}/${SEND_MAX_ATTEMPTS}): ${lastError}; retrying in ${SEND_RETRY_DELAY_MS}ms`,
       );
-    } catch (err) {
-      log?.info?.(`[wechat] sendFast threw, falling back: ${err}`);
+      await sleep(SEND_RETRY_DELAY_MS);
     }
   }
-  // Crucially: respect SendResult.success. Rust SendMessagePlan can return
-  // success=false (chat-select missed, send button never re-enabled, etc.)
-  // and historically we silently ignored it — caller would see "Queue end"
-  // with no error, lastSeenId would advance, and the user would never get
-  // the reply. Throw so the outer pipeline reports the failure and the
-  // catch-up loop retries on the next poll.
-  const result = await client.sendMessage({ chatId, text });
-  if (!result.success) {
-    throw new Error(`sendMessage failed: ${result.error ?? "unknown"}`);
-  }
+  throw new Error(`sendMessage failed after ${SEND_MAX_ATTEMPTS} attempt(s): ${lastError}`);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
