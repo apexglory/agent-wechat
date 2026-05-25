@@ -31,7 +31,17 @@ export type RecentEntry = { text: string; ts: number };
 
 export const A11Y_DEDUP_WINDOW_MS = 1_800_000; // 30 min — recentlySentReplies safety net
 export const A11Y_DB_RACE_WINDOW_MS = 180_000; // 3 min — fast-path→DB catch-up race window
-export const A11Y_PENDING_SEND_WINDOW_MS = 15_000; // 15 s — defer fast-path on marker miss after a recent send
+// 60 s — defer fast-path on marker miss while a send may still be unrendered.
+// Was 15 s; bumped 2026-05-25 after watching wxid_xxoxed61kmwv22 dispatch the
+// same "咋样" six times at ~30 s intervals because sendFast had reported ok
+// for the first five sends (xdotool exit-0) but wechat never registered the
+// Enter, so the bot's reply bubble never appeared in a11y and every following
+// marker lookup missed → fell back to slice(-unread) → re-dispatched. 60 s
+// covers two full poll cycles past a Queue end so a marker miss within that
+// window is overwhelmingly "send actually failed" rather than "bubble still
+// rendering". The DB path (lastSeenId-filtered) backstops anything legitimate
+// that arrives during the defer window.
+export const A11Y_PENDING_SEND_WINDOW_MS = 60_000;
 
 export const recentlySentReplies = new Map<string, RecentEntry[]>(); // wxid -> normalized outbound texts (dedup bot's own)
 export const a11yDispatchedContent = new Map<string, RecentEntry[]>(); // wxid -> normalized contents already dispatched via a11y
