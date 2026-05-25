@@ -133,12 +133,132 @@ pub async fn send_to_frame(
         return err(format!("xdotool Return failed: {}", r.stderr));
     }
 
+    // Post-send verify: re-dump a11y and check the message actually landed.
+    // xdotool reports exit 0 whether or not wechat consumed the keystroke —
+    // observed 2026-05-25 on wxid_xxoxed61kmwv22: five sendFast calls in a
+    // row reported ok but wechat never registered the Enter (focus race,
+    // input box hadn't quite focused, etc.), so the bubble never appeared
+    // in wcdb and the caller's marker logic re-dispatched the inbound msg
+    // for ~3 minutes. Without this check the failure is invisible upstream.
+    //
+    // Best-effort: an a11y dump failure or a missing frame doesn't fail the
+    // send (we don't know the truth). We only flip to ok=false when we can
+    // see that the input box still holds our text OR the bottom bubble in
+    // the Messages list doesn't match what we just sent.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    if let Ok(post_tree) = get_a11y_app("wechat", options).await {
+        if let Some(post_frame) = find_frame(&post_tree, frame_name) {
+            // Check 1: input box should be empty (wechat clears it on send).
+            if let Some(post_input) = find_editable_text(post_frame) {
+                let remaining = post_input.name.trim();
+                let sent_trim = text.trim();
+                if !remaining.is_empty()
+                    && (remaining == sent_trim || remaining.contains(sent_trim))
+                {
+                    return err(format!(
+                        "post-send verify failed: input still holds text after Return ({:?})",
+                        remaining.chars().take(40).collect::<String>()
+                    ));
+                }
+            }
+            // Check 2: the bottom of the Messages list should be the text we
+            // just sent (modulo a11y truncation of long bubbles).
+            if let Some(msg_list) = find_messages_list(post_frame) {
+                if let Some(children) = &msg_list.children {
+                    let last_bubble = children
+                        .iter()
+                        .rev()
+                        .map(|c| c.name.as_str())
+                        .find(|n| !is_timestamp_row(n));
+                    if let Some(bubble) = last_bubble {
+                        let bubble_norm = normalize_bubble(bubble);
+                        let sent_norm = normalize_bubble(text);
+                        if !bubbles_match(&bubble_norm, &sent_norm) {
+                            return err(format!(
+                                "post-send verify failed: bottom bubble {:?} doesn't match sent {:?}",
+                                bubble_norm.chars().take(40).collect::<String>(),
+                                sent_norm.chars().take(40).collect::<String>()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     FrameSendResult {
         ok: true,
         error: None,
         window_id: Some(wid),
         input_bounds: Some(bounds),
     }
+}
+
+fn find_messages_list<'a>(node: &'a A11yNode) -> Option<&'a A11yNode> {
+    if node.role == "list" && node.name == "Messages" {
+        return Some(node);
+    }
+    if let Some(children) = &node.children {
+        for c in children {
+            if let Some(found) = find_messages_list(c) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn is_timestamp_row(s: &str) -> bool {
+    // Matches "HH:MM" or "HH:MM:SS" (the timestamp rows wechat puts between
+    // bubbles). Aligned with A11Y_TIMESTAMP_ROW_RE in monitor.ts.
+    let trimmed = s.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 4 || bytes.len() > 8 {
+        return false;
+    }
+    let mut colons = 0;
+    for &b in bytes {
+        if b == b':' {
+            colons += 1;
+        } else if !b.is_ascii_digit() {
+            return false;
+        }
+    }
+    colons == 1 || colons == 2
+}
+
+fn normalize_bubble(s: &str) -> String {
+    // Collapse runs of whitespace to single space, then trim. Mirrors
+    // normalizeBubbleText in the TS echo-guard so the two layers match.
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(c);
+            last_was_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn bubbles_match(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    // a11y truncates long bubbles; tolerate prefix matches once we're past
+    // the noise floor for trivially-short strings. Aligned with bubblesMatch
+    // in the TS echo-guard.
+    if a.chars().count() >= 12 && b.chars().count() >= 12 {
+        if a.starts_with(b) || b.starts_with(a) {
+            return true;
+        }
+    }
+    false
 }
 
 async fn activate_window(wid: &str, options: &ExecOptions) -> Result<(), String> {
