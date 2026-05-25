@@ -88,110 +88,149 @@ pub async fn send_to_frame(
     let cx = (bounds.x + bounds.width / 2.0).round() as i32;
     let cy = (bounds.y + bounds.height / 2.0).round() as i32;
 
-    // 3-7. Take the global UI lock for the actual xdotool sequence.
+    // 3-7. Take the global UI lock for the actual xdotool sequence. Held
+    // across the focus restore below so the cleanup also runs serialized.
     let _plan_guard = acquire_plan_lock().await;
 
-    if let Err(e) = activate_window(&wid, options).await {
-        return err(format!("windowactivate failed: {e}"));
-    }
-    if let Err(e) = set_clipboard(text).await {
-        return err(format!("xclip failed: {e}"));
-    }
+    // Snapshot the currently-active X11 window so we can restore focus on
+    // every exit path. activate_window below moves X11 focus to the
+    // popped-out frame; the slow-path fallback (chat_select /
+    // SendMessagePlan) never calls windowactivate itself, so any focus
+    // leak from this function causes the slow path's xdotool key events
+    // to land in the popped-out frame instead of the main wechat window.
+    // Observed downstream as "block reply failed: No action selected"
+    // loops that only recover when a human VNC-clicks the main window
+    // (qiafan2-bot Server A, 2026-05-25 ~10:40 UTC).
+    let prior_active: Option<String> = {
+        let r = exec_command("xdotool", &["getactivewindow"], options).await;
+        if r.exit_code == 0 {
+            let s = r.stdout.trim().to_string();
+            (!s.is_empty()).then_some(s)
+        } else {
+            None
+        }
+    };
+    let wid_for_restore = wid.clone();
 
-    // Focus input, paste, send. Wait between steps so the UI keeps up.
-    //
-    // NOTE: do NOT pass `--sync` to mousemove. xdotool's --sync waits for an
-    // X motion event; if the pointer is already at the target coords (e.g.
-    // sending a second message to the same chat in a row, with the cursor
-    // still parked on the input box), no motion event ever fires and the
-    // command hangs for its internal timeout (~16s) before we hit our own
-    // exec timeout. `windowactivate --sync` above already guarantees focus.
-    let click_args = [
-        "mousemove",
-        &cx.to_string(),
-        &cy.to_string(),
-        "click",
-        "1",
-    ];
-    let r = exec_command("xdotool", &click_args, options).await;
-    if r.exit_code != 0 {
-        return err(format!("xdotool focus click failed: {}", r.stderr));
-    }
+    // All focus-touching work runs inside this block so we have a single
+    // exit point at which to restore focus.
+    let result: FrameSendResult = async move {
+        if let Err(e) = activate_window(&wid, options).await {
+            return err(format!("windowactivate failed: {e}"));
+        }
+        if let Err(e) = set_clipboard(text).await {
+            return err(format!("xclip failed: {e}"));
+        }
 
-    // Small delay so the click finishes registering before paste keystroke
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        // Focus input, paste, send. Wait between steps so the UI keeps up.
+        //
+        // NOTE: do NOT pass `--sync` to mousemove. xdotool's --sync waits for an
+        // X motion event; if the pointer is already at the target coords (e.g.
+        // sending a second message to the same chat in a row, with the cursor
+        // still parked on the input box), no motion event ever fires and the
+        // command hangs for its internal timeout (~16s) before we hit our own
+        // exec timeout. `windowactivate --sync` above already guarantees focus.
+        let click_args = [
+            "mousemove",
+            &cx.to_string(),
+            &cy.to_string(),
+            "click",
+            "1",
+        ];
+        let r = exec_command("xdotool", &click_args, options).await;
+        if r.exit_code != 0 {
+            return err(format!("xdotool focus click failed: {}", r.stderr));
+        }
 
-    let r = exec_command("xdotool", &["key", "--clearmodifiers", "ctrl+v"], options).await;
-    if r.exit_code != 0 {
-        return err(format!("xdotool paste failed: {}", r.stderr));
-    }
+        // Small delay so the click finishes registering before paste keystroke
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let r = exec_command("xdotool", &["key", "--clearmodifiers", "ctrl+v"], options).await;
+        if r.exit_code != 0 {
+            return err(format!("xdotool paste failed: {}", r.stderr));
+        }
 
-    let r = exec_command("xdotool", &["key", "--clearmodifiers", "Return"], options).await;
-    if r.exit_code != 0 {
-        return err(format!("xdotool Return failed: {}", r.stderr));
-    }
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
-    // Post-send verify: re-dump a11y and check the message actually landed.
-    // xdotool reports exit 0 whether or not wechat consumed the keystroke —
-    // observed 2026-05-25 on wxid_xxoxed61kmwv22: five sendFast calls in a
-    // row reported ok but wechat never registered the Enter (focus race,
-    // input box hadn't quite focused, etc.), so the bubble never appeared
-    // in wcdb and the caller's marker logic re-dispatched the inbound msg
-    // for ~3 minutes. Without this check the failure is invisible upstream.
-    //
-    // Best-effort: an a11y dump failure or a missing frame doesn't fail the
-    // send (we don't know the truth). We only flip to ok=false when we can
-    // see that the input box still holds our text OR the bottom bubble in
-    // the Messages list doesn't match what we just sent.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    if let Ok(post_tree) = get_a11y_app("wechat", options).await {
-        if let Some(post_frame) = find_frame(&post_tree, frame_name) {
-            // Check 1: input box should be empty (wechat clears it on send).
-            if let Some(post_input) = find_editable_text(post_frame) {
-                let remaining = post_input.name.trim();
-                let sent_trim = text.trim();
-                if !remaining.is_empty()
-                    && (remaining == sent_trim || remaining.contains(sent_trim))
-                {
-                    return err(format!(
-                        "post-send verify failed: input still holds text after Return ({:?})",
-                        remaining.chars().take(40).collect::<String>()
-                    ));
+        let r = exec_command("xdotool", &["key", "--clearmodifiers", "Return"], options).await;
+        if r.exit_code != 0 {
+            return err(format!("xdotool Return failed: {}", r.stderr));
+        }
+
+        // Post-send verify: re-dump a11y and check the message actually landed.
+        // xdotool reports exit 0 whether or not wechat consumed the keystroke —
+        // observed 2026-05-25 on wxid_xxoxed61kmwv22: five sendFast calls in a
+        // row reported ok but wechat never registered the Enter (focus race,
+        // input box hadn't quite focused, etc.), so the bubble never appeared
+        // in wcdb and the caller's marker logic re-dispatched the inbound msg
+        // for ~3 minutes. Without this check the failure is invisible upstream.
+        //
+        // Best-effort: an a11y dump failure or a missing frame doesn't fail the
+        // send (we don't know the truth). We only flip to ok=false when we can
+        // see that the input box still holds our text OR the bottom bubble in
+        // the Messages list doesn't match what we just sent.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Ok(post_tree) = get_a11y_app("wechat", options).await {
+            if let Some(post_frame) = find_frame(&post_tree, frame_name) {
+                // Check 1: input box should be empty (wechat clears it on send).
+                if let Some(post_input) = find_editable_text(post_frame) {
+                    let remaining = post_input.name.trim();
+                    let sent_trim = text.trim();
+                    if !remaining.is_empty()
+                        && (remaining == sent_trim || remaining.contains(sent_trim))
+                    {
+                        return err(format!(
+                            "post-send verify failed: input still holds text after Return ({:?})",
+                            remaining.chars().take(40).collect::<String>()
+                        ));
+                    }
                 }
-            }
-            // Check 2: the bottom of the Messages list should be the text we
-            // just sent (modulo a11y truncation of long bubbles).
-            if let Some(msg_list) = find_messages_list(post_frame) {
-                if let Some(children) = &msg_list.children {
-                    let last_bubble = children
-                        .iter()
-                        .rev()
-                        .map(|c| c.name.as_str())
-                        .find(|n| !is_timestamp_row(n));
-                    if let Some(bubble) = last_bubble {
-                        let bubble_norm = normalize_bubble(bubble);
-                        let sent_norm = normalize_bubble(text);
-                        if !bubbles_match(&bubble_norm, &sent_norm) {
-                            return err(format!(
-                                "post-send verify failed: bottom bubble {:?} doesn't match sent {:?}",
-                                bubble_norm.chars().take(40).collect::<String>(),
-                                sent_norm.chars().take(40).collect::<String>()
-                            ));
+                // Check 2: the bottom of the Messages list should be the text we
+                // just sent (modulo a11y truncation of long bubbles).
+                if let Some(msg_list) = find_messages_list(post_frame) {
+                    if let Some(children) = &msg_list.children {
+                        let last_bubble = children
+                            .iter()
+                            .rev()
+                            .map(|c| c.name.as_str())
+                            .find(|n| !is_timestamp_row(n));
+                        if let Some(bubble) = last_bubble {
+                            let bubble_norm = normalize_bubble(bubble);
+                            let sent_norm = normalize_bubble(text);
+                            if !bubbles_match(&bubble_norm, &sent_norm) {
+                                return err(format!(
+                                    "post-send verify failed: bottom bubble {:?} doesn't match sent {:?}",
+                                    bubble_norm.chars().take(40).collect::<String>(),
+                                    sent_norm.chars().take(40).collect::<String>()
+                                ));
+                            }
                         }
                     }
                 }
             }
         }
+
+        FrameSendResult {
+            ok: true,
+            error: None,
+            window_id: Some(wid),
+            input_bounds: Some(bounds),
+        }
+    }
+    .await;
+
+    // Restore focus to whatever was active before we activated the popped-out
+    // frame. Done unconditionally — even on success, leaving focus on a
+    // popped-out frame breaks the next outbound send if it routes through the
+    // slow path on a different chat. Best-effort: a cleanup failure shouldn't
+    // override the real send result.
+    if let Some(prev) = prior_active.as_deref() {
+        if prev != wid_for_restore {
+            let _ = exec_command("xdotool", &["windowactivate", "--sync", prev], options).await;
+        }
     }
 
-    FrameSendResult {
-        ok: true,
-        error: None,
-        window_id: Some(wid),
-        input_bounds: Some(bounds),
-    }
+    result
 }
 
 fn find_messages_list<'a>(node: &'a A11yNode) -> Option<&'a A11yNode> {
