@@ -27,6 +27,7 @@ pub struct SendMessagePlanState {
     pub phase: SendMessagePhase,
     pub open_result: Option<OpenChatResult>,
     pub confirm_attempts: u32,
+    pub reopen_attempts: u32,
 }
 
 fn find_edit_and_send_button(a11y: &A11yNode) -> Option<(&A11yNode, &A11yNode)> {
@@ -86,6 +87,7 @@ impl Plan for SendMessagePlan {
             phase: SendMessagePhase::Opening,
             open_result: None,
             confirm_attempts: 0,
+            reopen_attempts: 0,
         }
     }
 
@@ -140,7 +142,11 @@ impl Plan for SendMessagePlan {
                         })
                     });
 
-                    let force = main_state_id == Some("chat");
+                    // On a wrong-chat retry (set by the Focusing guard below), force
+                    // chat-select even though we're already in chat_open — otherwise
+                    // open_chat's "already selected" short-circuit would skip again on
+                    // the same stale selectSession index that caused the mis-open.
+                    let force = main_state_id == Some("chat") || plan_state.reopen_attempts > 0;
                     let result = open_chat(&params.chat_id, force, click_xy).await;
 
                     if !result.ok {
@@ -166,6 +172,39 @@ impl Plan for SendMessagePlan {
                 SendMessagePhase::Focusing => {
                     if main_state_id != Some("chat_open") {
                         return None;
+                    }
+
+                    // Guard against chat-select landing on the wrong conversation.
+                    // chat-select hooks selectSession and rewrites the session index;
+                    // when that index is stale or mis-mapped it can return ok=true
+                    // (often skipped=true on "already selected") while the UI is still
+                    // on a different chat. Without this check we'd Focus → type →
+                    // Return into the wrong chat's input box — observed as cross-talk
+                    // where APEX_GLORY (perpetually pinned at the top of the chat
+                    // list on Server A) received messages destined for other
+                    // customers (2026-05-25). Mirrors the receive_transfer guard
+                    // added in 136a57f.
+                    if let Some(opened) = state.main_window.opened_chat_username.as_deref() {
+                        if opened != params.chat_id {
+                            if plan_state.reopen_attempts >= 3 {
+                                tracing::warn!(
+                                    "[send_message] opened wrong chat: expected {}, got {}; giving up after {} reopen attempts",
+                                    params.chat_id,
+                                    opened,
+                                    plan_state.reopen_attempts
+                                );
+                                return None;
+                            }
+                            tracing::warn!(
+                                "[send_message] opened wrong chat: expected {}, got {}; reopening (attempt {})",
+                                params.chat_id,
+                                opened,
+                                plan_state.reopen_attempts + 1
+                            );
+                            plan_state.reopen_attempts += 1;
+                            plan_state.phase = SendMessagePhase::Opening;
+                            continue;
+                        }
                     }
 
                     let found = find_edit_and_send_button(a11y);
