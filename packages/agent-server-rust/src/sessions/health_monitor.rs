@@ -127,7 +127,13 @@ pub fn spawn_health_monitor() {
                         if since.elapsed().as_secs() >= delay {
                             spawn_wechat(&session);
                             restart_count += 1;
-                            waiting_restart_since = None;
+                            // Reset the timer instead of clearing it: if the new
+                            // process dies before the next scan can observe it,
+                            // was_running stays false and the `if was_running`
+                            // branch above wouldn't re-arm the timer — leaving
+                            // health monitoring permanently stuck. The Some(pid)
+                            // branch clears this once a live process is seen.
+                            waiting_restart_since = Some(Instant::now());
                         }
                     }
 
