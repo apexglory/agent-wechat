@@ -28,6 +28,7 @@ pub struct SendMessagePlanState {
     pub open_result: Option<OpenChatResult>,
     pub confirm_attempts: u32,
     pub reopen_attempts: u32,
+    pub chat_escape_clicks: u32,
 }
 
 fn find_edit_and_send_button(a11y: &A11yNode) -> Option<(&A11yNode, &A11yNode)> {
@@ -88,6 +89,7 @@ impl Plan for SendMessagePlan {
             open_result: None,
             confirm_attempts: 0,
             reopen_attempts: 0,
+            chat_escape_clicks: 0,
         }
     }
 
@@ -150,6 +152,45 @@ impl Plan for SendMessagePlan {
                     let result = open_chat(&params.chat_id, force, click_xy).await;
 
                     if !result.ok {
+                        // Self-heal: when we're stuck in `chat` state (chat list
+                        // visible, no chat open) and open_chat keeps failing, click
+                        // the first visible chat list item via xdotool to escape.
+                        // chat-select pokes WeChat's internal selectSession memory
+                        // at build-specific offsets; if that index is stale (e.g.
+                        // post-restart, or after WeChat dropped focus to the list)
+                        // the poke returns ok=false and the plan has no other way
+                        // out. A raw xdotool click on any list item naturally
+                        // transitions to chat_open on whatever got clicked; the
+                        // pre-check at the top of Opening then falls through and
+                        // re-runs open_chat from chat_open state, where the
+                        // selectSession lookup usually succeeds (and even if it
+                        // mis-opens, the Focusing wrong-chat guard catches it).
+                        // Capped at 2 clicks per plan instance to avoid looping
+                        // when WeChat itself is broken. Observed 2026-05-25 on
+                        // qiafan2-bot Server A as "No action selected" loops that
+                        // only recovered when a human VNC-clicked the chat list.
+                        if main_state_id == Some("chat")
+                            && plan_state.chat_escape_clicks < 2
+                        {
+                            if let Some((x, y)) = click_xy {
+                                plan_state.chat_escape_clicks += 1;
+                                tracing::warn!(
+                                    "[send_message] open_chat failed for {} while stuck in `chat`; clicking first list item to escape (attempt {})",
+                                    params.chat_id,
+                                    plan_state.chat_escape_clicks
+                                );
+                                return Some(SelectedAction {
+                                    action: actions::sequence(vec![
+                                        actions::click_at(x, y),
+                                        actions::wait_short(),
+                                    ]),
+                                    frame: identified
+                                        .main_window
+                                        .as_ref()
+                                        .and_then(|m| m.frame.clone()),
+                                });
+                            }
+                        }
                         return None;
                     }
 
