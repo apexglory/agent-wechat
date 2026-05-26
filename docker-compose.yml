@@ -1,13 +1,22 @@
-# Sample docker-compose for standalone agent-wechat2 deployment.
-# Generate a token before starting:
-#   mkdir -p ~/.config/agent-wechat2
-#   openssl rand -hex 32 > ~/.config/agent-wechat2/token
-#   chmod 600 ~/.config/agent-wechat2/token
+# Compose for the actually-deployed agent-wechat container on Server A.
+# Aligned with `docker inspect agent-wechat` 2026-05-25 — DO NOT edit
+# container_name / image / volume names / network without also recreating:
+# changing them causes `compose up` to create new empty volumes and lose
+# the WeChat login state.
+#
+# This file is NOT the same as the wechat-bot repo's docker-compose.yml.
+# Repo file is an init template (apexglory/agent-wechat2 + named volumes).
+# Production here uses the older thisnick/agent-wechat image and volumes
+# that were created by a previous compose project "agent-wechat".
+#
+# Time zone: TZ env added 2026-05-25 to fix WeChat UI showing UTC.
+# Filesystem /etc/localtime was hot-patched live on the same date; this env
+# locks it in for the next time the container is recreated.
 
 services:
-  agent-wechat2:
-    image: ghcr.io/apexglory/agent-wechat2:0.11.15
-    container_name: agent-wechat2
+  agent-wechat:
+    image: ghcr.io/thisnick/agent-wechat:0.11.15
+    container_name: agent-wechat
     security_opt:
       - seccomp=unconfined
     cap_add:
@@ -16,13 +25,24 @@ services:
     ports:
       - "6174:6174"
     volumes:
-      - agent-wechat2-data:/data
-      - agent-wechat2-home:/home/wechat
-      - ~/.config/agent-wechat2/token:/data/auth-token:ro
+      - agent-wechat-data:/data
+      - agent-wechat-home:/home/wechat
+      - /root/.config/agent-wechat/token:/data/auth-token:ro
     environment:
       - PROXY=${PROXY:-}
+      - DISPLAY=:99
+      - AGENT_DB_PATH=/data/agent.db
+      - AGENT_PORT=6174
+      - TZ=${TZ:-Asia/Shanghai}
     restart: unless-stopped
 
 volumes:
-  agent-wechat2-data:
-  agent-wechat2-home:
+  # Explicit `name:` pins the literal volume name to match what was created
+  # by the previous compose project "agent-wechat" — otherwise compose
+  # would auto-derive a different prefixed name and miss the existing data.
+  agent-wechat-data:
+    name: agent-wechat_agent-wechat-data
+    external: true
+  agent-wechat-home:
+    name: agent-wechat_agent-wechat-home
+    external: true
