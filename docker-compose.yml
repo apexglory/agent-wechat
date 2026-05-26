@@ -34,6 +34,8 @@ services:
       - AGENT_DB_PATH=/data/agent.db
       - AGENT_PORT=6174
       - TZ=${TZ:-Asia/Shanghai}
+      - LANG=C.UTF-8
+      - LC_ALL=C.UTF-8
     restart: unless-stopped
 
 volumes:
