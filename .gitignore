@@ -47,3 +47,8 @@ wechat_files/
 
 .idea
 /temp
+# Host-specific compose overrides — each deployment writes its own,
+# never committed (see docker-compose.yml header + dev-notes/compose-override-examples.md).
+docker-compose.override.yml
+docker-compose.override.yaml
+docker-compose.yml.bak.*

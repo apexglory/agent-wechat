@@ -1,17 +1,16 @@
-# Compose for the actually-deployed agent-wechat container on Server A.
-# Aligned with `docker inspect agent-wechat` 2026-05-25 — DO NOT edit
-# container_name / image / volume names / network without also recreating:
-# changing them causes `compose up` to create new empty volumes and lose
-# the WeChat login state.
+# Base compose for the agent-wechat container.
 #
-# This file is NOT the same as the wechat-bot repo's docker-compose.yml.
-# Repo file is an init template (apexglory/agent-wechat2 + named volumes).
-# Production here uses the older thisnick/agent-wechat image and volumes
-# that were created by a previous compose project "agent-wechat".
+# Per-host bits (network_mode, volume names, proxy env, ...) live in a
+# local docker-compose.override.yml that is gitignored. Compose merges
+# both files automatically when you run `docker compose up` from this
+# directory. See dev-notes/compose-override-examples.md for samples.
 #
-# Time zone: TZ env added 2026-05-25 to fix WeChat UI showing UTC.
-# Filesystem /etc/localtime was hot-patched live on the same date; this env
-# locks it in for the next time the container is recreated.
+# Env vars set here are environment-agnostic and required by every
+# deployment:
+#   - TZ: WeChat UI defaults to UTC without it
+#   - LANG / LC_ALL: WeChat 4.x writes empty X11 WM_NAME for non-ASCII
+#     chat titles under POSIX locale (xdotool search returns 0 hits,
+#     sendFast fails, fallback sendMessage surfaces 'No action selected')
 
 services:
   agent-wechat:
@@ -29,7 +28,6 @@ services:
       - agent-wechat-home:/home/wechat
       - /root/.config/agent-wechat/token:/data/auth-token:ro
     environment:
-      - PROXY=${PROXY:-}
       - DISPLAY=:99
       - AGENT_DB_PATH=/data/agent.db
       - AGENT_PORT=6174
@@ -39,12 +37,9 @@ services:
     restart: unless-stopped
 
 volumes:
-  # Explicit `name:` pins the literal volume name to match what was created
-  # by the previous compose project "agent-wechat" — otherwise compose
-  # would auto-derive a different prefixed name and miss the existing data.
+  # Both volumes are external — override must supply the actual volume name
+  # via `name:` to match what the legacy container created on this host.
   agent-wechat-data:
-    name: agent-wechat_agent-wechat-data
     external: true
   agent-wechat-home:
-    name: agent-wechat_agent-wechat-home
     external: true
