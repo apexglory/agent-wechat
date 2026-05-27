@@ -54,6 +54,10 @@ RUN mkdir -p /output && cp target/${BUILD_MODE}/agent-server /output/agent-serve
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+# Bake Asia/Shanghai as the container default so WeChat / agent-server /
+# message timestamps render in CST without needing -e TZ at run time.
+# Can still be overridden at run time by passing -e TZ=<zone>.
+ENV TZ=Asia/Shanghai
 ARG UBUNTU_APT_MIRROR=http://mirrors.aliyun.com
 
 # Use Aliyun mirror for Ubuntu apt. http (not https) because ubuntu:22.04
@@ -74,6 +78,8 @@ RUN apt-get update && apt-get install -y \
     dunst libnotify-bin \
     # Fonts
     fonts-noto-cjk \
+    # Timezone data (needed for the ENV TZ above to actually resolve)
+    tzdata \
     # System
     dbus dbus-x11 ca-certificates curl \
     # WeChat dependencies (basic)
@@ -95,6 +101,11 @@ RUN apt-get update && apt-get install -y \
     # Python packages for tools
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# Resolve /etc/localtime + /etc/timezone for apps that read the files
+# directly (Qt/Chromium, some Rust crates) instead of TZ env. Must come
+# after tzdata is installed so the zoneinfo file exists.
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # ============================================
 # Python packages

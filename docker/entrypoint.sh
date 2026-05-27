@@ -4,6 +4,10 @@ set -euo pipefail
 # ============================================
 # Environment setup
 # ============================================
+# Default to Asia/Shanghai so timestamps in WeChat / agent-server logs /
+# tool output render in CST even if the image was built without ENV TZ.
+# Override by passing -e TZ=<zone> to docker run / docker-compose.
+export TZ=${TZ:-Asia/Shanghai}
 export DISPLAY=${DISPLAY:-:99}
 export QT_ACCESSIBILITY=${QT_ACCESSIBILITY:-1}
 export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=${QT_LINUX_ACCESSIBILITY_ALWAYS_ON:-1}
