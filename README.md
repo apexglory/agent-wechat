@@ -148,10 +148,10 @@ See [CLAUDE.md](./CLAUDE.md) for full technical documentation.
 
 
 # 1. 进入容器查看 VNC 进程
-docker exec agent-wechat2 ps aux | grep -i vnc
+docker exec agent-wechat ps aux | grep -i vnc
 
 # 2. 关闭原 VNC 进程 (PID 47)
-docker exec agent-wechat2 kill
+docker exec agent-wechat kill
 
 # 3. 重启 VNC（去掉 -viewonly）
-docker exec -d agent-wechat2 x11vnc -display :99 -forever -nopw -shared -xkb -rfbport 5900 -listen 127.0.0.1
+docker exec -d agent-wechat x11vnc -display :99 -forever -nopw -shared -xkb -rfbport 5900 -listen 127.0.0.1
