@@ -58,14 +58,34 @@ pub async fn send_to_frame(
     }
 
     // 1. Resolve X11 window id by exact window name match.
+    //
+    // Two contacts/groups can legitimately share a display name in WeChat
+    // (saw this on 118.196.48.97: two different friends both named the same
+    // string). Both popped-out frames carry the same WM_NAME, so xdotool
+    // returns multiple window ids and any pick is a 50/50 — observed as
+    // messages landing in the wrong chat. Detect that and bail to the slow
+    // path, which resolves by chat_id (wxid) via chat_select and is immune
+    // to name collisions.
     let pattern = format!("^{}$", regex_escape(frame_name));
     let search = exec_command("xdotool", &["search", "--name", &pattern], options).await;
     if search.exit_code != 0 {
         return err(format!("xdotool search failed: {}", search.stderr));
     }
-    let wid = match search.stdout.lines().next() {
-        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return err(format!("no window matching name {frame_name:?}")),
+    let wids: Vec<String> = search
+        .stdout
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let wid = match wids.len() {
+        0 => return err(format!("no window matching name {frame_name:?}")),
+        1 => wids.into_iter().next().unwrap(),
+        n => {
+            return err(format!(
+                "ambiguous window name {frame_name:?}: {n} X11 windows match ({}); falling back to slow path",
+                wids.join(",")
+            ));
+        }
     };
 
     // 2. Find input bounds in the matching a11y frame.
