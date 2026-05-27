@@ -79,6 +79,7 @@ pub async fn auth_status() -> Json<serde_json::Value> {
         create_context(session.clone(), &db)
     };
 
+    let mut recognized = false;
     if let Some(ref mw) = identified.main_window {
         if let Some(state_impl) = find_state_by_id(&mw.state_id) {
             let screenshot_bytes = base64::engine::general_purpose::STANDARD
@@ -89,7 +90,15 @@ pub async fn auth_status() -> Json<serde_json::Value> {
                 a11y: &a11y,
                 screenshot: &screenshot_bytes,
             });
+            recognized = true;
         }
+    }
+
+    // No IA state matched the current UI: don't trust the persisted `logged_in`
+    // flag (it would phantom-report a session that has actually been logged out
+    // into an unrecognized splash). Treat unknown UI as logged_out.
+    if !recognized {
+        context.state.main_window.is_logged_in = false;
     }
 
     // Save updated state
@@ -100,13 +109,16 @@ pub async fn auth_status() -> Json<serde_json::Value> {
 
     let status = if context.state.main_window.is_logged_in {
         "logged_in"
-    } else {
+    } else if recognized {
         "logged_out"
+    } else {
+        "unknown"
     };
 
     tracing::info!(
-        "[auth_status] view={:?}, status={}",
+        "[auth_status] view={:?}, recognized={}, status={}",
         context.state.main_window.view,
+        recognized,
         status
     );
 
