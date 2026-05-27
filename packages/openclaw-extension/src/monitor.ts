@@ -22,13 +22,28 @@ import {
 } from "./automation-filter.js";
 import { runSerializedWeChatOperation } from "./operation-queue.ts";
 import {
+  enqueueCoalescedMessage,
+  type EnqueueOptions,
+} from "./inbound-coalesce.ts";
+
+// How long to wait for additional messages from the same user before
+// dispatching to the agent. 800ms is a balance: long enough to absorb
+// "user typed three lines back-to-back" naturally (typical inter-message
+// gap on WeChat mobile is 200-600ms), short enough that a single message
+// still feels responsive (the agent only starts thinking after this).
+// Also gives the next monitor poll cycle a chance to add late-arriving
+// messages to the same batch (default poll interval is 500ms).
+const INBOUND_COALESCE_DEBOUNCE_MS = 800;
+import {
   A11Y_DB_RACE_WINDOW_MS,
   A11Y_PENDING_SEND_WINDOW_MS,
   a11yChatBottom,
   a11yDispatchedContent,
+  a11yPendingDbConfirm,
   bubblesMatch,
   cleanupRecent,
   consumeRecent,
+  hasUnconsumedEntries,
   normalizeBubbleText,
   noteOutboundText,
   recentContains,
@@ -138,6 +153,16 @@ const A11Y_AUDIO_NAME_RE = /^Audio\d+/i;
 const HISTORY_CONTEXT_MARKER = "[Chat messages since your last reply - for context]";
 const CURRENT_MESSAGE_MARKER = "[Current message - respond to this]";
 
+// Burst marker — used when the inbound-coalesce module merges several
+// rapid-fire messages from the same user into one dispatch. Critically
+// different from HISTORY_CONTEXT_MARKER: every line under the burst marker
+// is part of the CURRENT turn (all actionable, none are untrusted history).
+// The SOP files in workspace-qiafan2-bot / workspace-qiafan2-service must
+// recognise this marker and treat the listed messages as one user turn with
+// multiple lines.
+const BURST_CURRENT_MESSAGES_MARKER =
+  "[Current turn - user sent N messages in quick succession; treat every line below as part of the same user turn]";
+
 export interface WeChatMonitorOptions {
   account: ResolvedWeChatAccount;
   abortSignal: AbortSignal;
@@ -230,19 +255,50 @@ async function dispatchA11yTextMessage(
     isMentioned: false,
   };
 
-  await dispatchSegment(
-    [pm],
-    client,
-    chatId,
-    chat,
-    liveAccount,
-    policy,
-    storeAllowFrom,
-    allowTextCommands,
-    cfg,
-    log,
-    undefined,
-  );
+  // Route through inbound-coalesce so a11y-bursts (e.g. user typing 3
+  // lines in rapid succession, each picked up by the a11y diff before the
+  // DB-path catch-up runs) merge into a single agent turn. Control
+  // commands stay on the synchronous path so they take effect immediately.
+  const isCtrl =
+    allowTextCommands &&
+    core.channel.commands.isControlCommandMessage(pm.commandBody, cfg);
+  if (isCtrl) {
+    await dispatchSegment(
+      [pm],
+      client,
+      chatId,
+      chat,
+      liveAccount,
+      policy,
+      storeAllowFrom,
+      allowTextCommands,
+      cfg,
+      log,
+      undefined,
+    );
+  } else {
+    const sessionKey = `${liveAccount.accountId}::${chatId}`;
+    enqueueCoalescedMessage<ProcessedMessage>(
+      sessionKey,
+      pm,
+      async (mergedSegment) => {
+        return await dispatchSegment(
+          mergedSegment,
+          client,
+          chatId,
+          chat,
+          liveAccount,
+          policy,
+          storeAllowFrom,
+          allowTextCommands,
+          cfg,
+          log,
+          undefined,
+        );
+      },
+      { debounceMs: INBOUND_COALESCE_DEBOUNCE_MS, log },
+    );
+  }
 }
 
 // A failed agent reply is NOT recovered by the catch-up loop: that loop only
@@ -587,46 +643,69 @@ export async function startWeChatMonitor(
           // High-water mark: items below the previously-recorded bottom
           // bubble are the new ones. Anything at-or-above (including bot's
           // own replies, since the send path updates the marker) is skipped.
+          //
+          // Two-stage lookup:
+          //   (1) Positional — if the marker carries an eligibleLen recorded
+          //       by a prior fast-path tick AND the bubble at that index still
+          //       matches the marker text, slice from oldLen. This is the ONLY
+          //       correct path for consecutive identical-text bubbles ("在么"
+          //       → "在么" sent twice in a row): pure text search picks the
+          //       LATEST match, hiding the user's second send and letting
+          //       consumeRecent eat the eventual DB row → message lost.
+          //   (2) Backwards text search — fallback for chat reflow / scroll
+          //       and for markers set by noteOutboundText (which doesn't know
+          //       eligibleLen since the bot reply hasn't rendered yet).
           const bottomMarker = a11yChatBottom.get(wxid);
-          let candidates: Array<{ trimmed: string; norm: string }>;
+          let candidates: Array<{ trimmed: string; norm: string }> = [];
           let markerFound = false;
           let deferredForPendingSend = false;
           if (bottomMarker) {
-            let idx = -1;
-            for (let i = eligible.length - 1; i >= 0; i--) {
-              if (bubblesMatch(eligible[i].norm, bottomMarker)) {
-                idx = i;
-                break;
-              }
-            }
-            if (idx >= 0) {
-              candidates = eligible.slice(idx + 1);
+            const oldLen = bottomMarker.eligibleLen;
+            const positionalHit =
+              typeof oldLen === "number" &&
+              oldLen >= 1 &&
+              oldLen <= eligible.length &&
+              bubblesMatch(eligible[oldLen - 1].norm, bottomMarker.text);
+            if (positionalHit) {
+              candidates = eligible.slice(oldLen as number);
               markerFound = true;
             } else {
-              // Marker not in eligible. Two reasons to be careful before
-              // falling back to slice(-unread):
-              //   (a) chat scrolled / restart — marker truly stale → fallback
-              //   (b) send just completed and the bubble hasn't rendered in
-              //       a11y yet → fallback would RE-DISPATCH the inbound msg
-              //       that triggered the send (saw this 2026-05-19 20:06:39:
-              //       Queue end 20:06:38.604, fast-path 511ms later, marker
-              //       points to bot's not-yet-rendered reply, missed → fell
-              //       back → second dispatch of "有啥料可以加").
-              // Distinguish via recentlySentReplies: if anything's been sent
-              // in the last A11Y_PENDING_SEND_WINDOW_MS, treat as (b) and
-              // DEFER (skip this poll, leave marker as-is so next poll picks
-              // up the bubble when it renders).
-              const cutoff = Date.now() - A11Y_PENDING_SEND_WINDOW_MS;
-              const pendingArr = recentlySentReplies.get(wxid);
-              const pendingSend = pendingArr?.some((e) => e.ts >= cutoff) ?? false;
-              if (pendingSend) {
-                log?.info?.(
-                  `[wechat:${account.accountId}] a11y fast-path defer ${unreadChat.name}: marker miss but recent send within ${A11Y_PENDING_SEND_WINDOW_MS / 1000}s; bubble likely still rendering`,
-                );
-                candidates = [];
-                deferredForPendingSend = true;
+              let idx = -1;
+              for (let i = eligible.length - 1; i >= 0; i--) {
+                if (bubblesMatch(eligible[i].norm, bottomMarker.text)) {
+                  idx = i;
+                  break;
+                }
+              }
+              if (idx >= 0) {
+                candidates = eligible.slice(idx + 1);
+                markerFound = true;
               } else {
-                candidates = eligible.slice(-unreadChat.unread);
+                // Marker not in eligible. Two reasons to be careful before
+                // falling back to slice(-unread):
+                //   (a) chat scrolled / restart — marker truly stale → fallback
+                //   (b) send just completed and the bubble hasn't rendered in
+                //       a11y yet → fallback would RE-DISPATCH the inbound msg
+                //       that triggered the send (saw this 2026-05-19 20:06:39:
+                //       Queue end 20:06:38.604, fast-path 511ms later, marker
+                //       points to bot's not-yet-rendered reply, missed → fell
+                //       back → second dispatch of "有啥料可以加").
+                // Distinguish via recentlySentReplies: if anything's been sent
+                // in the last A11Y_PENDING_SEND_WINDOW_MS, treat as (b) and
+                // DEFER (skip this poll, leave marker as-is so next poll picks
+                // up the bubble when it renders).
+                const cutoff = Date.now() - A11Y_PENDING_SEND_WINDOW_MS;
+                const pendingArr = recentlySentReplies.get(wxid);
+                const pendingSend = pendingArr?.some((e) => e.ts >= cutoff) ?? false;
+                if (pendingSend) {
+                  log?.info?.(
+                    `[wechat:${account.accountId}] a11y fast-path defer ${unreadChat.name}: marker miss but recent send within ${A11Y_PENDING_SEND_WINDOW_MS / 1000}s; bubble likely still rendering`,
+                  );
+                  candidates = [];
+                  deferredForPendingSend = true;
+                } else {
+                  candidates = eligible.slice(-unreadChat.unread);
+                }
               }
             }
           } else if (lastSeenId.has(wxid)) {
@@ -655,41 +734,88 @@ export async function startWeChatMonitor(
             candidates = eligible.slice(-unreadChat.unread);
           }
 
-          // Reseat the marker to the current bottom-most eligible bubble.
-          // Skip on defer so the bot-reply-text marker remains and the next
-          // poll (which should see the rendered bubble) can find it.
-          if (!deferredForPendingSend) {
-            const lastEligible = eligible[eligible.length - 1];
-            a11yChatBottom.set(wxid, lastEligible.norm);
-          }
-
-          for (const item of candidates) {
+          // candidates is always a SUFFIX of eligible — both the positional
+          // and text-search paths slice from some index toward the end. The
+          // start index in eligible is therefore (length - candidates.length).
+          // Tracking it lets us reseat the marker with the correct eligibleLen
+          // after a partial-batch failure (see below).
+          const candidateStart = eligible.length - candidates.length;
+          let lastHandledIdx = -1;
+          let dispatchFailed = false;
+          for (let i = 0; i < candidates.length; i++) {
+            const item = candidates[i];
+            const eligibleIdx = candidateStart + i;
             // Defense-in-depth: bot's own reply, in case the send path's
-            // marker reseat hasn't landed yet (e.g. media-only reply).
+            // marker reseat hasn't landed yet (e.g. media-only reply). The
+            // marker should still advance past it (the bubble is accounted
+            // for), so update lastHandledIdx before continuing.
             // NOTE: we do NOT also reject against a11yDispatchedContent
             // here. The marker already gives us "consecutive duplicates
             // only" semantics; rejecting on a 30-min text ring would kill
             // legitimate user repeats like: "2" → bot reply → "2".
-            if (recentContains(recentlySentReplies, wxid, item.norm)) continue;
-
-            // Recorded for the DB catch-up loop to skip the same text when
-            // WCDB flushes ~9s later (the A11Y_DB_RACE_WINDOW_MS lookup).
-            recordRecent(a11yDispatchedContent, wxid, item.norm);
+            if (recentContains(recentlySentReplies, wxid, item.norm)) {
+              lastHandledIdx = eligibleIdx;
+              continue;
+            }
+            // Pending-DB-confirm is recorded BEFORE dispatch so the empty-
+            // fetch path in processUnreadChat defers its lastSeenId advance
+            // until the matching Msg_* row lands — WCDB sometimes flushes
+            // session.db (lastMsgLocalId ↑) before the Msg_* row appears,
+            // and advancing here would silently drop the row when it
+            // arrives. Cleared in prepareMessage when the DB row is seen.
+            recordRecent(a11yPendingDbConfirm, wxid, item.norm);
             log?.info?.(
               `[wechat:${account.accountId}] a11y fast-path dispatching to ${unreadChat.name} (unread=${unreadChat.unread}, marker=${markerFound ? "hit" : "miss"}): ${item.trimmed.slice(0, 60)}`,
             );
             try {
               await dispatchA11yTextMessage(client, account, cfg, chat, item.trimmed, log);
             } catch (err) {
+              // Don't reseat marker past a failed candidate and don't drain
+              // the rest of the batch — the next a11y tick will retry from
+              // this point (preserving order, which the marker logic relies
+              // on). The a11yPendingDbConfirm entry stays live so empty-
+              // fetch keeps deferring; a11yDispatchedContent has NO entry
+              // for this candidate, so when the DB row eventually lands it
+              // goes through the normal path instead of being suppressed.
               log?.error?.(
                 `[wechat:${account.accountId}] a11y fast-path dispatch failed: ${err}`,
               );
+              dispatchFailed = true;
+              break;
+            }
+            // Successful dispatch — only NOW record into the DB-suppress
+            // ring so a failed dispatch doesn't cause the matching DB row
+            // to be silently dropped.
+            recordRecent(a11yDispatchedContent, wxid, item.norm);
+            lastHandledIdx = eligibleIdx;
+          }
+
+          // Reseat the marker. Skip on pending-send defer so the bot-reply
+          // marker stays put.
+          //   - Some candidate handled: marker = that bubble, eligibleLen
+          //     set so the next tick's positional lookup uses it directly.
+          //   - No candidates AND no failure: marker = current bottom.
+          //   - All candidates failed (lastHandledIdx === -1 + dispatchFailed):
+          //     leave marker untouched → next tick retries the entire batch.
+          if (!deferredForPendingSend) {
+            if (lastHandledIdx >= 0) {
+              a11yChatBottom.set(wxid, {
+                text: eligible[lastHandledIdx].norm,
+                eligibleLen: lastHandledIdx + 1,
+              });
+            } else if (!dispatchFailed) {
+              const lastEligible = eligible[eligible.length - 1];
+              a11yChatBottom.set(wxid, {
+                text: lastEligible.norm,
+                eligibleLen: eligible.length,
+              });
             }
           }
         }
 
         cleanupRecent(recentlySentReplies);
         cleanupRecent(a11yDispatchedContent);
+        cleanupRecent(a11yPendingDbConfirm);
       }
 
       // Filter to chats with unreads (skip system / service accounts).
@@ -812,12 +938,22 @@ async function prepareMessage(
   // and dispatches). The window is generous (minutes) because WCDB's batched
   // flush can lag well past the old 30s window (observed 44s), which is what
   // double-dispatched the message before this fix.
+  //
+  // Always also consume a11yPendingDbConfirm (whether or not the dispatch-
+  // content ring suppresses): the empty-fetch defer in processUnreadChat is
+  // gated on pending entries, and once the DB row has materialized there's
+  // no reason to keep blocking lastSeenId advance for it. A failed fast-path
+  // attempt leaves a pending entry with NO matching dispatched-content entry,
+  // so this branch takes the suppress-or-not decision purely from
+  // a11yDispatchedContent while still clearing the pending defer.
   if (msg.kind === "text" && msg.content) {
+    const norm = normalizeBubbleText(msg.content);
+    consumeRecent(a11yPendingDbConfirm, chatId, norm, A11Y_DB_RACE_WINDOW_MS);
     if (
       consumeRecent(
         a11yDispatchedContent,
         chatId,
-        normalizeBubbleText(msg.content),
+        norm,
         A11Y_DB_RACE_WINDOW_MS,
       )
     ) {
@@ -1108,12 +1244,19 @@ async function dispatchSegment(
         sessionKey: route.sessionKey,
       });
 
-    // Build body — with history context if batching multiple messages
+    // Build body — burst (multi-message) vs single message.
+    //
+    // A multi-message segment means the inbound-coalesce module merged
+    // several rapid-fire messages from the same user into one dispatch.
+    // ALL of them are part of the current turn — none are history. Using
+    // HISTORY_CONTEXT_MARKER here is the 2026-05-21 漏单 bug (action intent
+    // in the earlier line silently dropped because SOP treats history as
+    // untrusted), so we use BURST_CURRENT_MESSAGES_MARKER instead and leave
+    // InboundHistory empty.
     let body: string;
     let inboundHistory: Array<{ sender: string; body: string; timestamp?: number }> | undefined;
 
     if (segment.length === 1) {
-      // Single message — format as today
       body = core.channel.reply.formatAgentEnvelope({
         channel: "WeChat",
         from: fromLabel,
@@ -1123,52 +1266,35 @@ async function dispatchSegment(
         body: isGroup ? `${senderName}: ${rawBody}` : rawBody,
       });
     } else {
-      // Multi-message batch: earlier messages become history context
-      const historyMessages = segment.slice(0, -1);
-
-      // Format history entries
-      const historyLines = historyMessages.map((pm) => {
+      const burstLines = segment.map((pm, idx) => {
         const entryBody = pm.isGroup ? `${pm.senderName}: ${pm.rawBody}` : pm.rawBody;
         return core.channel.reply.formatAgentEnvelope({
           channel: "WeChat",
           from: fromLabel,
           timestamp: pm.timestamp,
+          // Only the very first burst line gets previousTimestamp (the
+          // "since you last replied" anchor); subsequent lines are part of
+          // the same turn so omit it to avoid confusing envelope formatters.
+          previousTimestamp: idx === 0 ? previousTimestamp : undefined,
           envelope: envelopeOptions,
           body: entryBody,
         });
       });
 
-      // Format current (last) message
-      const currentLine = core.channel.reply.formatAgentEnvelope({
-        channel: "WeChat",
-        from: fromLabel,
-        timestamp,
-        previousTimestamp,
-        envelope: envelopeOptions,
-        body: isGroup ? `${senderName}: ${rawBody}` : rawBody,
-      });
-
-      // Combine with history context markers
-      body = [
-        HISTORY_CONTEXT_MARKER,
-        ...historyLines,
-        "",
-        CURRENT_MESSAGE_MARKER,
-        currentLine,
-      ].join("\n");
-
-      // Structured history for InboundHistory field
-      inboundHistory = historyMessages.map((pm) => ({
-        sender: pm.senderName,
-        body: pm.rawBody,
-        timestamp: pm.timestamp,
-      }));
+      const burstHeader = BURST_CURRENT_MESSAGES_MARKER.replace(
+        "N messages",
+        `${segment.length} messages`,
+      );
+      body = [burstHeader, ...burstLines].join("\n");
     }
 
-    // For non-final batches, instruct agent to suppress reply (NO_REPLY token)
-    if (remainingSegments && remainingSegments > 0) {
-      body += `\n\n[More messages incoming — respond only with NO_REPLY]`;
-    }
+    // NOTE: the old "[More messages incoming — respond only with NO_REPLY]"
+    // suppression token is removed because the inbound-coalesce module
+    // merges in-flight messages into a single dispatch; there is no longer
+    // such a thing as a "non-final batch" at this layer. dispatchA11yTextMessage
+    // (which still calls dispatchSegment directly outside the coalesce path)
+    // never passes remainingSegments either, so we just ignore the param.
+    void remainingSegments;
 
     // Build inbound context
     const ctxPayload = core.channel.reply.finalizeInboundContext({
@@ -1429,6 +1555,20 @@ async function processUnreadChat(
     // session.db tip so the chat stays quiet until WCDB reports a newer
     // localId (i.e. a genuine new message).
     if (chat.lastMsgLocalId && chat.lastMsgLocalId > prevLastSeen) {
+      // BUT: if the fast-path attempted to dispatch a message for this chat
+      // within the WCDB race window, advancing here would skip the row when
+      // it eventually lands in Msg_* (we'd already be past its localId, and
+      // prepareMessage's a11y-dispatched dedup would never fire since the
+      // row never gets fetched). Defer until the row materializes (and
+      // prepareMessage clears the pending entry) or the window times out.
+      // For brandsessionholder-style placeholder chats there's no fast-path
+      // entry, so the advance still runs as before.
+      if (hasUnconsumedEntries(a11yPendingDbConfirm, chatId, A11Y_DB_RACE_WINDOW_MS)) {
+        log?.info?.(
+          `[wechat:${liveAccount.accountId}] ${chatId}: deferring empty-fetch lastSeenId advance (fast-path attempt awaiting WCDB)`,
+        );
+        return;
+      }
       await setLastSeenAndPersist(
         liveAccount.accountId,
         lastSeenId,
@@ -1568,36 +1708,88 @@ async function processUnreadChat(
     }
   }
 
-  // Split into segments at media boundaries and dispatch each
+  // Dispatch policy:
+  //   - DM messages without control commands go through the inbound-coalesce
+  //     module: each message is enqueued and the actual agent dispatch runs
+  //     asynchronously after a debounce window, merging any messages that
+  //     arrive in quick succession into a single agent turn. This eliminates
+  //     reply-order races and naturally batches user bursts. lastSeenId is
+  //     advanced as soon as the message is enqueued (single dispatch
+  //     failures inside coalesce are logged but not retried — UI hiccups
+  //     are already covered by SEND_MAX_ATTEMPTS inside the deliver chain).
+  //   - Group chats and control commands stay on the synchronous path so
+  //     the existing mention / group-history / control-command semantics
+  //     (clearBufferedHistory after all dispatched, lastSeenId rewind on
+  //     failure) keep working unchanged.
   let allDispatched = true;
   if (processed.length > 0) {
-    const segments = hasControlCommandInWindow
-      ? processed.map((pm) => [pm])
-      : buildSegments(processed);
-    log?.info?.(
-      `[wechat:${liveAccount.accountId}] ${chatId}: ${processed.length} dispatchable msg(s) in ${segments.length} segment(s)`,
-    );
-    for (let i = 0; i < segments.length; i++) {
-      const remaining = segments.length - i - 1;
-      const dispatched = await dispatchSegment(
-        segments[i],
-        client,
-        chatId,
-        chat,
-        liveAccount,
-        policy,
-        storeAllowFrom,
-        allowTextCommands,
-        cfg,
-        log,
-        hasControlCommandInWindow ? undefined : remaining,
+    const useCoalesce = !isGroup && !hasControlCommandInWindow;
+
+    if (useCoalesce) {
+      log?.info?.(
+        `[wechat:${liveAccount.accountId}] ${chatId}: enqueueing ${processed.length} msg(s) into inbound-coalesce`,
       );
-      if (!dispatched) {
-        allDispatched = false;
+      const sessionKey = `${liveAccount.accountId}::${chatId}`;
+      const enqueueOpts: EnqueueOptions = {
+        debounceMs: INBOUND_COALESCE_DEBOUNCE_MS,
+        log,
+      };
+      for (const pm of processed) {
+        enqueueCoalescedMessage<ProcessedMessage>(
+          sessionKey,
+          pm,
+          // Each enqueue captures a fresh closure with the current cfg /
+          // policy / liveAccount snapshot. inbound-coalesce uses the most
+          // recent closure for the eventual flush, so config hot-reloads
+          // applied between polls take effect for the next dispatch.
+          async (mergedSegment) => {
+            return await dispatchSegment(
+              mergedSegment,
+              client,
+              chatId,
+              chat,
+              liveAccount,
+              policy,
+              storeAllowFrom,
+              allowTextCommands,
+              cfg,
+              log,
+              undefined,
+            );
+          },
+          enqueueOpts,
+        );
       }
-    }
-    if (clearBufferedHistory && allDispatched && groupHistory) {
-      groupHistory.set(chatId, []);
+      // Fire-and-forget: allDispatched stays true so lastSeenId advances.
+    } else {
+      const segments = hasControlCommandInWindow
+        ? processed.map((pm) => [pm])
+        : buildSegments(processed);
+      log?.info?.(
+        `[wechat:${liveAccount.accountId}] ${chatId}: ${processed.length} dispatchable msg(s) in ${segments.length} segment(s) (sync path: group=${isGroup}, ctrlCmd=${hasControlCommandInWindow})`,
+      );
+      for (let i = 0; i < segments.length; i++) {
+        const remaining = segments.length - i - 1;
+        const dispatched = await dispatchSegment(
+          segments[i],
+          client,
+          chatId,
+          chat,
+          liveAccount,
+          policy,
+          storeAllowFrom,
+          allowTextCommands,
+          cfg,
+          log,
+          hasControlCommandInWindow ? undefined : remaining,
+        );
+        if (!dispatched) {
+          allDispatched = false;
+        }
+      }
+      if (clearBufferedHistory && allDispatched && groupHistory) {
+        groupHistory.set(chatId, []);
+      }
     }
   }
 

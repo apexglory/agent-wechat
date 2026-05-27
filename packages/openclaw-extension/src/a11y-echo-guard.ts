@@ -6,17 +6,35 @@
 // can't tell inbound from outbound, so the ONLY thing keeping the bot's own
 // reply bubbles from being read back as fresh user messages is this state:
 //
-//   a11yChatBottom         — per-chat (wxid) high-water marker: the normalized
-//                            text of the most recent visible bubble. Items
-//                            below it on the next poll are the dispatch
-//                            candidates; anything at-or-above (incl. the bot's
-//                            own replies) is skipped.
+//   a11yChatBottom         — per-chat (wxid) high-water marker. Records the
+//                            normalized text of the most recent visible bubble
+//                            AND, when the fast-path set it, the eligible-list
+//                            length at that moment. Next-tick lookup tries
+//                            positional first (eligible[oldLen-1].text matches
+//                            markerText → slice from oldLen) and falls back to
+//                            backwards text search on mismatch — this is the
+//                            only way to disambiguate consecutive identical-
+//                            text bubbles, which a pure text marker collapses
+//                            into "I've already seen this" → next user repeat
+//                            never dispatches and the DB row gets eaten by
+//                            consumeRecent.
 //   recentlySentReplies    — ring of bot outbound texts per wxid; defense in
 //                            depth against echoing a bot bubble if the marker
 //                            reseat hasn't landed yet.
-//   a11yDispatchedContent  — texts already dispatched via the fast-path, used
-//                            by the DB catch-up loop to skip the same message
-//                            once WCDB flushes it ~9s later.
+//   a11yDispatchedContent  — texts SUCCESSFULLY dispatched via the fast-path,
+//                            used by the DB catch-up loop to skip the same
+//                            message once WCDB flushes it ~9s later. Recorded
+//                            only after dispatch returns — otherwise a failed
+//                            fast-path send would silently suppress the eventual
+//                            DB row and the message would be permanently lost.
+//   a11yPendingDbConfirm   — texts the fast-path ATTEMPTED to dispatch (success
+//                            or failure), per wxid. While any entry is live,
+//                            processUnreadChat's empty-fetch lastSeenId advance
+//                            is deferred: WCDB may have flushed session.db
+//                            (lastMsgLocalId ↑) before the Msg_* row, and
+//                            advancing here would skip the row when it lands.
+//                            Cleared by prepareMessage when the matching DB
+//                            row finally goes through.
 //
 // CRITICAL: this state MUST be reseated by EVERY outbound text path, not just
 // the monitor's inline reply. The agent's replies are delivered asynchronously
@@ -44,10 +62,19 @@ export const A11Y_DB_RACE_WINDOW_MS = 180_000; // 3 min — fast-path→DB catch
 export const A11Y_PENDING_SEND_WINDOW_MS = 60_000;
 
 export const recentlySentReplies = new Map<string, RecentEntry[]>(); // wxid -> normalized outbound texts (dedup bot's own)
-export const a11yDispatchedContent = new Map<string, RecentEntry[]>(); // wxid -> normalized contents already dispatched via a11y
-// Per-chat normalized text of the most recent visible bubble (bot's reply OR last dispatch).
-// Items appearing below this marker on the next poll are the only candidates for dispatch.
-export const a11yChatBottom = new Map<string, string>();
+export const a11yDispatchedContent = new Map<string, RecentEntry[]>(); // wxid -> normalized contents successfully dispatched via a11y
+// Per-chat fast-path dispatch attempts (success OR failure) awaiting WCDB to
+// flush the corresponding Msg_* row. Empty-fetch lastSeenId advance defers
+// while any entry is live; entries are consumed when the matching DB row goes
+// through prepareMessage (and time-out via cleanupRecent as a safety net).
+export const a11yPendingDbConfirm = new Map<string, RecentEntry[]>();
+// Per-chat marker. `text` is the most recent visible bubble (bot's reply OR
+// last dispatched). `eligibleLen` is the size of the fast-path's `eligible`
+// list when the marker was set — only the fast-path knows this, so callers
+// outside it (e.g. noteOutboundText) leave it undefined to force the next-
+// tick lookup into backwards text search.
+export type ChatBottomMarker = { text: string; eligibleLen?: number };
+export const a11yChatBottom = new Map<string, ChatBottomMarker>();
 
 export function normalizeBubbleText(s: string): string {
   // WeChat tends to append "\n " to bubble labels; long bubbles are also
@@ -94,6 +121,21 @@ export function recentContains(
   return arr.some((e) => e.ts >= cutoff && bubblesMatch(e.text, text));
 }
 
+// True if `map` has any entry for `key` within `windowMs`. Used by the
+// empty-fetch path in processUnreadChat to decide whether to defer the
+// lastSeenId advance (waiting for an outstanding fast-path attempt's DB row
+// to land).
+export function hasUnconsumedEntries(
+  map: Map<string, RecentEntry[]>,
+  key: string,
+  windowMs: number = A11Y_DEDUP_WINDOW_MS,
+): boolean {
+  const arr = map.get(key);
+  if (!arr || arr.length === 0) return false;
+  const cutoff = Date.now() - windowMs;
+  return arr.some((e) => e.ts >= cutoff);
+}
+
 // Like recentContains, but removes the matched entry so it can only suppress
 // ONE later occurrence. The DB catch-up loop uses this to skip the single
 // WCDB row that mirrors an a11y-dispatched message, while still letting a
@@ -130,6 +172,8 @@ export function noteOutboundText(chatId: string, text: string): void {
   const norm = normalizeBubbleText(text);
   recordRecent(recentlySentReplies, chatId, norm);
   // Reseat the fast-path marker onto the bot's own bubble so the next a11y
-  // poll treats it as already-seen rather than a fresh inbound message.
-  a11yChatBottom.set(chatId, norm);
+  // poll treats it as already-seen rather than a fresh inbound message. No
+  // eligibleLen: caller doesn't know it, so the next-tick lookup falls back
+  // to backwards text search (which works fine for the unique bot text).
+  a11yChatBottom.set(chatId, { text: norm });
 }

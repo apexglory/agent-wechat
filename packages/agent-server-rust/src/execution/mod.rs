@@ -26,6 +26,14 @@ pub async fn acquire_plan_lock() -> tokio::sync::MutexGuard<'static, ()> {
     PLAN_LOCK.lock().await
 }
 
+/// Non-blocking variant of `acquire_plan_lock`. Used by the health monitor's
+/// auto-recovery path, which would rather skip a tick than fight an active
+/// plan for the UI.
+pub fn try_acquire_plan_lock(
+) -> Result<tokio::sync::MutexGuard<'static, ()>, tokio::sync::TryLockError> {
+    PLAN_LOCK.try_lock()
+}
+
 pub struct ExecutionResult {
     pub success: bool,
     pub error: Option<String>,

@@ -1,12 +1,17 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::execution::actions::execute_action;
+use crate::ia::actions as ia_actions;
 use crate::ia::identify_states;
+use crate::ia::types::{A11yNode, SubscriptionEvent};
 use crate::sessions::manager::get_session;
 use crate::tools::a11y::get_a11y_desktop;
 use crate::tools::exec::ExecOptions;
 use crate::tools::screenshot::capture_screenshot;
 use crate::tools::wechat_db::find_wechat_pid;
+use base64::Engine;
 
 /// How often to run the health scan (in seconds).
 const SCAN_INTERVAL_SECS: u64 = 1;
@@ -21,6 +26,13 @@ const RESTART_DELAY_SECS: u64 = 3;
 const MAX_RAPID_RESTARTS: u32 = 5;
 const RAPID_WINDOW_SECS: u64 = 60;
 const BACKOFF_DELAY_SECS: u64 = 30;
+
+/// Minimum gap between auto-click recovery attempts on the LoginAccount splash.
+const LOGIN_RECOVERY_COOLDOWN_SECS: u64 = 30;
+
+/// Where pre-kill diagnostic dumps go. Lives on the persistent `agent-wechat-data`
+/// volume so dumps survive container restarts.
+const HEALTH_DUMP_ROOT: &str = "/data/health-dumps";
 
 /// Global flag to pause health monitoring during active execution loops.
 static MONITORING_PAUSED: AtomicBool = AtomicBool::new(false);
@@ -55,8 +67,16 @@ fn spawn_wechat(session: &crate::ia::types::Session) {
 /// Spawn the background health monitor task.
 ///
 /// Every second, it checks the default session's WeChat process by running
-/// a11y → identify. If WeChat has crashed, it restarts it. If no IA state
-/// has been identified for more than 60 seconds, it kills and restarts it.
+/// a11y → identify. Three responsibilities:
+///   1. Restart WeChat if its process is gone.
+///   2. If `identify` returns no state for 60s straight, dump diagnostics and
+///      kill+restart the process. The dump lets us tell "WeChat hung" from
+///      "at-spi bridge hung" after the fact, since both look the same here.
+///   3. Auto-recover from a freshly-spawned WeChat that lands on the
+///      LoginAccount splash ("Enter Weixin"/"Log In") by clicking the login
+///      button once per cooldown window. This shadows what LoginPlan does, but
+///      runs without anyone calling /login — important because a watchdog-
+///      restarted WeChat often shows this splash even when the user is offline.
 pub fn spawn_health_monitor() {
     tokio::spawn(async move {
         tracing::info!("[health] WeChat health monitor started");
@@ -66,6 +86,9 @@ pub fn spawn_health_monitor() {
         let mut restart_count: u32 = 0;
         let mut window_start = Instant::now();
         let mut waiting_restart_since: Option<Instant> = None;
+        let mut last_a11y: Option<A11yNode> = None;
+        let mut last_screenshot_b64: Option<String> = None;
+        let mut last_login_click: Option<Instant> = None;
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(SCAN_INTERVAL_SECS)).await;
@@ -151,8 +174,16 @@ pub fn spawn_health_monitor() {
             let a11y = match get_a11y_desktop(&exec_options).await {
                 Ok(tree) => tree,
                 Err(_) => {
-                    // a11y failed — count as unresponsive, don't reset timer
-                    check_and_kill(wechat_pid, &last_identified);
+                    // a11y failed — count as unresponsive, don't reset timer.
+                    // Pass through whatever we last managed to capture so the
+                    // pre-kill dump still has something useful.
+                    check_and_kill(
+                        wechat_pid,
+                        &last_identified,
+                        last_a11y.as_ref(),
+                        last_screenshot_b64.as_deref(),
+                        "a11y query failed",
+                    );
                     continue;
                 }
             };
@@ -160,19 +191,97 @@ pub fn spawn_health_monitor() {
             let screenshot = capture_screenshot(&exec_options).await.unwrap_or_default();
             let identified = identify_states(&a11y, &screenshot);
 
-            if identified.main_window.is_some() {
-                // State identified — WeChat is responsive
+            // Refresh the rolling diagnostic snapshot so a future kill can dump
+            // the freshest tree we saw, not whatever's stale from earlier.
+            last_a11y = Some(a11y.clone());
+            last_screenshot_b64 = if screenshot.is_empty() {
+                None
+            } else {
+                Some(screenshot.clone())
+            };
+
+            if let Some(mw) = identified.main_window.as_ref() {
+                // State identified — WeChat is responsive.
                 last_identified = Instant::now();
+
+                // Auto-recover: a watchdog-restarted WeChat sitting on the
+                // saved-account splash ("Enter Weixin" / "Log In") will stay
+                // there forever unless something clicks. Do it ourselves.
+                //
+                // Guard against clicking through a popup that happens to be
+                // sitting on top of the splash — popup might be the real
+                // "logged in elsewhere" / risk-control dialog and the user
+                // needs to see it.
+                if mw.state_id == "login_account" && identified.popup.is_none() {
+                    let cooldown_ok = last_login_click
+                        .map(|t| t.elapsed().as_secs() >= LOGIN_RECOVERY_COOLDOWN_SECS)
+                        .unwrap_or(true);
+                    if cooldown_ok {
+                        let frame = mw.frame.clone();
+                        if try_auto_click_login(&exec_options, &a11y, frame.as_ref()).await {
+                            last_login_click = Some(Instant::now());
+                        }
+                    }
+                }
             } else {
                 // No state identified — check timeout
-                check_and_kill(wechat_pid, &last_identified);
+                check_and_kill(
+                    wechat_pid,
+                    &last_identified,
+                    Some(&a11y),
+                    if screenshot.is_empty() {
+                        None
+                    } else {
+                        Some(screenshot.as_str())
+                    },
+                    "no IA state matched",
+                );
             }
         }
     });
 }
 
-/// If time since last identified state exceeds the timeout, kill the WeChat process.
-fn check_and_kill(wechat_pid: i64, last_identified: &Instant) {
+/// Try to click the LoginAccount splash button. Returns true if we actually
+/// dispatched a click (so the caller can start the cooldown).
+///
+/// We acquire the global plan lock with try_lock — if a real plan is in flight
+/// we just skip and try again on the next tick. The lock guard MUST be held
+/// across the click await so xdotool isn't racing the plan loop for focus.
+async fn try_auto_click_login(
+    exec_options: &ExecOptions,
+    a11y: &A11yNode,
+    frame: Option<&crate::ia::types::FrameHint>,
+) -> bool {
+    let Ok(_lock) = crate::execution::try_acquire_plan_lock() else {
+        tracing::debug!("[health] auto-login skipped: plan lock busy");
+        return false;
+    };
+
+    tracing::warn!(
+        "[health] LoginAccount splash detected with no plan running — auto-clicking login button"
+    );
+
+    let noop_emit: &(dyn Fn(SubscriptionEvent) + Send + Sync) = &(|_| ());
+    execute_action(
+        &ia_actions::click_login(),
+        frame,
+        exec_options,
+        a11y,
+        noop_emit,
+    )
+    .await;
+    true
+}
+
+/// If time since last identified state exceeds the timeout, dump diagnostics
+/// then kill the WeChat process so the next loop iteration respawns it.
+fn check_and_kill(
+    wechat_pid: i64,
+    last_identified: &Instant,
+    a11y: Option<&A11yNode>,
+    screenshot_b64: Option<&str>,
+    reason: &str,
+) {
     let elapsed = last_identified.elapsed();
     if elapsed.as_secs() >= UNRESPONSIVE_TIMEOUT_SECS {
         tracing::warn!(
@@ -180,6 +289,13 @@ fn check_and_kill(wechat_pid: i64, last_identified: &Instant) {
             wechat_pid,
             elapsed.as_secs()
         );
+
+        // Dump first, then kill. If the dump itself takes a while we don't care
+        // — the process is already wedged.
+        let dump_dir = dump_diagnostics(wechat_pid, elapsed.as_secs(), reason, a11y, screenshot_b64);
+        if let Some(p) = dump_dir {
+            tracing::warn!("[health] Pre-kill diagnostics written to {}", p.display());
+        }
 
         let result = std::process::Command::new("kill")
             .args(["-9", &wechat_pid.to_string()])
@@ -209,5 +325,99 @@ fn check_and_kill(wechat_pid: i64, last_identified: &Instant) {
             elapsed.as_secs(),
             UNRESPONSIVE_TIMEOUT_SECS
         );
+    }
+}
+
+/// Write a snapshot of everything we know about the wedged WeChat process to a
+/// timestamped directory. Best-effort — any individual write failing is logged
+/// but does not abort the rest of the dump. Returns the dir path on success.
+fn dump_diagnostics(
+    pid: i64,
+    unresponsive_secs: u64,
+    reason: &str,
+    a11y: Option<&A11yNode>,
+    screenshot_b64: Option<&str>,
+) -> Option<PathBuf> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dir = PathBuf::from(HEALTH_DUMP_ROOT).join(format!("{ts}-pid{pid}"));
+
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!(
+            "[health] Failed to create dump dir {}: {}",
+            dir.display(),
+            e
+        );
+        return None;
+    }
+
+    // meta.json — minimal context so the dir is self-describing.
+    let meta = serde_json::json!({
+        "ts_unix": ts,
+        "pid": pid,
+        "unresponsive_secs": unresponsive_secs,
+        "reason": reason,
+        "has_a11y": a11y.is_some(),
+        "has_screenshot": screenshot_b64.is_some(),
+    });
+    write_file(&dir, "meta.json", meta.to_string().as_bytes());
+
+    if let Some(tree) = a11y {
+        match serde_json::to_vec_pretty(tree) {
+            Ok(bytes) => write_file(&dir, "a11y.json", &bytes),
+            Err(e) => tracing::warn!("[health] a11y serialize failed: {}", e),
+        }
+    }
+
+    if let Some(b64) = screenshot_b64 {
+        match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(bytes) => write_file(&dir, "screenshot.png", &bytes),
+            Err(e) => tracing::warn!("[health] screenshot decode failed: {}", e),
+        }
+    }
+
+    // ps + /proc info. These often give the answer outright (D-state =
+    // disk wait, Z = zombie, R but pegged CPU = busy loop, etc.).
+    write_file(&dir, "ps.txt", &run_capture("ps", &["-o", "pid,ppid,stat,pcpu,pmem,rss,vsz,etime,wchan:32,cmd", "-p", &pid.to_string()]));
+    write_file(&dir, "ps-tree.txt", &run_capture("ps", &["-o", "pid,ppid,stat,pcpu,pmem,rss,etime,cmd", "--forest", "-g", &pid.to_string()]));
+    write_file(
+        &dir,
+        "proc-status.txt",
+        &std::fs::read(format!("/proc/{pid}/status")).unwrap_or_default(),
+    );
+    write_file(
+        &dir,
+        "proc-wchan.txt",
+        &std::fs::read(format!("/proc/{pid}/wchan")).unwrap_or_default(),
+    );
+    write_file(
+        &dir,
+        "proc-stack.txt",
+        &std::fs::read(format!("/proc/{pid}/stack")).unwrap_or_default(),
+    );
+
+    Some(dir)
+}
+
+fn write_file(dir: &PathBuf, name: &str, bytes: &[u8]) {
+    let path = dir.join(name);
+    if let Err(e) = std::fs::write(&path, bytes) {
+        tracing::warn!("[health] failed to write {}: {}", path.display(), e);
+    }
+}
+
+fn run_capture(cmd: &str, args: &[&str]) -> Vec<u8> {
+    match std::process::Command::new(cmd).args(args).output() {
+        Ok(out) => {
+            let mut v = out.stdout;
+            if !out.stderr.is_empty() {
+                v.extend_from_slice(b"\n--- stderr ---\n");
+                v.extend_from_slice(&out.stderr);
+            }
+            v
+        }
+        Err(e) => format!("[run_capture] {cmd} failed: {e}\n").into_bytes(),
     }
 }
