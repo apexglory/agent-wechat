@@ -167,6 +167,16 @@ export function consumeRecent(
 // back as a new inbound message. MUST be called by every outbound text path
 // (the monitor's inline reply AND OpenClaw's async outbound adapter), keyed by
 // the destination wxid.
+//
+// CRITICAL ORDERING: call this BEFORE awaiting the send, not after. Since
+// agent-server commit b03369e (2026-05-25) the rust send_to_frame sleeps
+// 500 ms post-Return to verify the bubble landed via a11y — meaning the
+// bubble is rendered (and visible to the TS-side fast-path a11y poll) well
+// before the send promise resolves. Recording after the await leaves a
+// guaranteed ~500 ms window where recentlySentReplies is empty and the bot's
+// own bubble gets dispatched back as a fresh inbound (= self-echo loop).
+// On send failure, callers should clearOutboundText to revert this entry so
+// it doesn't suppress a hypothetical exactly-matching user message for 30 min.
 export function noteOutboundText(chatId: string, text: string): void {
   if (!text) return;
   const norm = normalizeBubbleText(text);
@@ -176,4 +186,15 @@ export function noteOutboundText(chatId: string, text: string): void {
   // eligibleLen: caller doesn't know it, so the next-tick lookup falls back
   // to backwards text search (which works fine for the unique bot text).
   a11yChatBottom.set(chatId, { text: norm });
+}
+
+// Revert the recentlySentReplies entry seeded by a prior noteOutboundText
+// call when the send turned out to fail. Without this, a failed send leaves
+// a 30-min ghost entry that would suppress a legitimate user message whose
+// text happens to match the unsent bot reply. The marker is left alone:
+// the next a11y poll will marker-miss and recover via the usual paths.
+export function clearOutboundText(chatId: string, text: string): void {
+  if (!text) return;
+  const norm = normalizeBubbleText(text);
+  consumeRecent(recentlySentReplies, chatId, norm);
 }

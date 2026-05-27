@@ -42,6 +42,7 @@ import {
   a11yPendingDbConfirm,
   bubblesMatch,
   cleanupRecent,
+  clearOutboundText,
   consumeRecent,
   hasUnconsumedEntries,
   normalizeBubbleText,
@@ -1429,14 +1430,28 @@ async function dispatchSegment(
                 }
                 // Send text caption separately if present
                 if (text) {
-                  await sendTextWithFastFallback(client, chat, chatId, text, log);
-                  // Reseat the fast-path marker on the bot's own bubble so
-                  // the next a11y poll won't read it as a new inbound msg.
+                  // Echo-guard MUST be seeded before the await — rust
+                  // send_to_frame's 500 ms post-Return verify means the
+                  // bubble is visible to fast-path a11y polls while the send
+                  // promise is still pending. See a11y-echo-guard.ts.
                   noteOutboundText(chatId, text);
+                  let sent = false;
+                  try {
+                    await sendTextWithFastFallback(client, chat, chatId, text, log);
+                    sent = true;
+                  } finally {
+                    if (!sent) clearOutboundText(chatId, text);
+                  }
                 }
               } else if (text) {
-                await sendTextWithFastFallback(client, chat, chatId, text, log);
                 noteOutboundText(chatId, text);
+                let sent = false;
+                try {
+                  await sendTextWithFastFallback(client, chat, chatId, text, log);
+                  sent = true;
+                } finally {
+                  if (!sent) clearOutboundText(chatId, text);
+                }
               }
             },
             log,

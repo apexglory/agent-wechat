@@ -15,7 +15,7 @@ import {
 } from "./agent-tools.js";
 import { normalizeWeChatCommandBody, normalizeWeChatId } from "./access-control.js";
 import { runSerializedWeChatOperation } from "./operation-queue.ts";
-import { noteOutboundText } from "./a11y-echo-guard.ts";
+import { clearOutboundText, noteOutboundText } from "./a11y-echo-guard.ts";
 
 const meta: ChannelPlugin["meta"] = {
   id: "wechat",
@@ -177,19 +177,27 @@ export const wechatPlugin: ChannelPlugin<ResolvedWeChatAccount> = {
         throw new Error("No serverUrl configured");
       }
       const client = new WeChatClient({ baseUrl: account.serverUrl, token: account.token });
-      const result = await runSerializedWeChatOperation(
-        account.accountId,
-        to,
-        `send text to ${to}`,
-        () => client.sendMessage({ chatId: to, text }),
-      );
-      if (!result.success) {
-        throw new Error(result.error ?? "Send failed");
-      }
-      // Reseat the a11y fast-path marker so the monitor doesn't read this
-      // bot reply back as a fresh inbound message (self-echo). The agent's
-      // replies arrive here, NOT through monitor.ts's inline reply path.
+      // Seed the echo-guard BEFORE the await: rust send_to_frame sleeps
+      // 500 ms post-Return for verify, during which the bubble is already
+      // rendered and visible to the a11y fast-path poll. Recording after the
+      // await leaves a window where the bot's own bubble gets dispatched
+      // back as inbound (self-echo). See a11y-echo-guard.ts for context.
       noteOutboundText(to, text);
+      let sent = false;
+      try {
+        const result = await runSerializedWeChatOperation(
+          account.accountId,
+          to,
+          `send text to ${to}`,
+          () => client.sendMessage({ chatId: to, text }),
+        );
+        if (!result.success) {
+          throw new Error(result.error ?? "Send failed");
+        }
+        sent = true;
+      } finally {
+        if (!sent) clearOutboundText(to, text);
+      }
       return {
         channel: "wechat" as const,
         messageId: `wechat:${to}:${Date.now()}`,
@@ -204,75 +212,87 @@ export const wechatPlugin: ChannelPlugin<ResolvedWeChatAccount> = {
       }
       const client = new WeChatClient({ baseUrl: account.serverUrl, token: account.token });
       if (mediaUrl) {
-        const result = await runSerializedWeChatOperation(
-          account.accountId,
-          to,
-          `send media to ${to}`,
-          async () => {
-            const fsmod = await import("fs/promises");
-            const pathmod = await import("path");
-
-            let base64: string;
-            let mimeType: string;
-            let filename: string;
-            if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
-              const res = await fetch(mediaUrl);
-              const buffer = await res.arrayBuffer();
-              base64 = Buffer.from(buffer).toString("base64");
-              mimeType = res.headers.get("content-type") ?? "application/octet-stream";
-              const urlPath = new URL(mediaUrl).pathname;
-              filename = pathmod.basename(urlPath) || "file";
-            } else {
-              const buf = await fsmod.readFile(mediaUrl);
-              base64 = buf.toString("base64");
-              filename = pathmod.basename(mediaUrl);
-              const ext = pathmod.extname(mediaUrl).toLowerCase().replace(".", "");
-              const extMime: Record<string, string> = {
-                png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
-                gif: "image/gif", webp: "image/webp",
-              };
-              mimeType = extMime[ext] ?? "application/octet-stream";
-            }
-
-            const isImage = mimeType.startsWith("image/");
-            return isImage
-              ? client.sendMessage({
-                  chatId: to,
-                  text: text || undefined,
-                  image: { data: base64, mimeType },
-                })
-              : client.sendMessage({
-                  chatId: to,
-                  text: text || undefined,
-                  file: { data: base64, filename },
-                });
-          },
-        );
-        if (!result.success) {
-          throw new Error(result.error ?? "Send media failed");
-        }
-        // A media bubble carries no marker text, but a caption does — reseat
-        // it so the caption isn't echoed back as a fresh inbound message.
+        // Caption text race-guards same as sendText (see comment there). The
+        // media bubble itself carries no marker text; only the caption does.
         if (text) noteOutboundText(to, text);
+        let mediaSent = false;
+        try {
+          const result = await runSerializedWeChatOperation(
+            account.accountId,
+            to,
+            `send media to ${to}`,
+            async () => {
+              const fsmod = await import("fs/promises");
+              const pathmod = await import("path");
+
+              let base64: string;
+              let mimeType: string;
+              let filename: string;
+              if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
+                const res = await fetch(mediaUrl);
+                const buffer = await res.arrayBuffer();
+                base64 = Buffer.from(buffer).toString("base64");
+                mimeType = res.headers.get("content-type") ?? "application/octet-stream";
+                const urlPath = new URL(mediaUrl).pathname;
+                filename = pathmod.basename(urlPath) || "file";
+              } else {
+                const buf = await fsmod.readFile(mediaUrl);
+                base64 = buf.toString("base64");
+                filename = pathmod.basename(mediaUrl);
+                const ext = pathmod.extname(mediaUrl).toLowerCase().replace(".", "");
+                const extMime: Record<string, string> = {
+                  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+                  gif: "image/gif", webp: "image/webp",
+                };
+                mimeType = extMime[ext] ?? "application/octet-stream";
+              }
+
+              const isImage = mimeType.startsWith("image/");
+              return isImage
+                ? client.sendMessage({
+                    chatId: to,
+                    text: text || undefined,
+                    image: { data: base64, mimeType },
+                  })
+                : client.sendMessage({
+                    chatId: to,
+                    text: text || undefined,
+                    file: { data: base64, filename },
+                  });
+            },
+          );
+          if (!result.success) {
+            throw new Error(result.error ?? "Send media failed");
+          }
+          mediaSent = true;
+        } finally {
+          if (!mediaSent && text) clearOutboundText(to, text);
+        }
         return {
           channel: "wechat" as const,
           messageId: `wechat:${to}:${Date.now()}`,
         };
       }
       // Text-only fallback
-      const result = await runSerializedWeChatOperation(
-        account.accountId,
-        to,
-        `send text to ${to}`,
-        () => client.sendMessage({
-          chatId: to,
-          text: text || undefined,
-        }),
-      );
-      if (!result.success) {
-        throw new Error(result.error ?? "Send failed");
-      }
       if (text) noteOutboundText(to, text);
+      let textSent = false;
+      try {
+        const result = await runSerializedWeChatOperation(
+          account.accountId,
+          to,
+          `send text to ${to}`,
+          () => client.sendMessage({
+            chatId: to,
+            text: text || undefined,
+          }),
+        );
+        if (!result.success) {
+          throw new Error(result.error ?? "Send failed");
+        }
+        textSent = true;
+      } finally {
+        if (!textSent && text) clearOutboundText(to, text);
+      }
       return {
         channel: "wechat" as const,
         messageId: `wechat:${to}:${Date.now()}`,
