@@ -109,16 +109,38 @@ fn message_list_bounds(a11y: &A11yNode) -> Option<&Bounds> {
         .as_ref()
 }
 
-fn click_transfer_card(bounds: &Bounds, is_self: bool) -> Action {
-    let max_offset = (bounds.width - 24.0).max(bounds.width / 2.0);
-    let min_offset = 160.0_f64.min(max_offset);
-    let x_offset = (bounds.width * 0.24).clamp(min_offset, max_offset);
-    let x = if is_self {
-        bounds.x + bounds.width - x_offset
+fn click_transfer_card(bubble: &Bounds, list_bounds: Option<&Bounds>, is_self: bool) -> Action {
+    // WeChat's a11y reports a list-item's full bounds even when it's scrolled
+    // partly out of the Messages viewport. Without clipping, a transfer card
+    // sitting at the top of the message history can land its computed center y
+    // ABOVE the visible list area, and the click hits the (non-interactive)
+    // chat header — receive dialog never opens, ClickingReceive times out,
+    // user sees "No action selected". Observed 2026-05-28 on APEX_GLORY's
+    // chat: bubble bounds y=44 h=111, list viewport y=101..591, click_y
+    // computed as 99 (= 44 + 55), 2 px above the list.
+    //
+    // Fix: clip the click target's y to the intersection of bubble and
+    // viewport before taking the midpoint.
+    let (vis_top, vis_bot) = if let Some(lb) = list_bounds {
+        (
+            bubble.y.max(lb.y),
+            (bubble.y + bubble.height).min(lb.y + lb.height),
+        )
     } else {
-        bounds.x + x_offset
+        (bubble.y, bubble.y + bubble.height)
     };
-    actions::click_at(x.round(), (bounds.y + bounds.height / 2.0).round())
+    let y = ((vis_top + vis_bot) / 2.0).round();
+
+    let max_offset = (bubble.width - 24.0).max(bubble.width / 2.0);
+    let min_offset = 160.0_f64.min(max_offset);
+    let x_offset = (bubble.width * 0.24).clamp(min_offset, max_offset);
+    let x = (if is_self {
+        bubble.x + bubble.width - x_offset
+    } else {
+        bubble.x + x_offset
+    })
+    .round();
+    actions::click_at(x, y)
 }
 
 fn is_transfer_dialog_frame(frame: &A11yNode) -> bool {
@@ -402,10 +424,11 @@ impl Plan for ReceiveTransferPlan {
                     let transfer_node = find_transfer_message(a11y, params.amount_text.as_deref());
                     if let Some(node) = transfer_node {
                         if let Some(bounds) = &node.bounds {
+                            let list_b = message_list_bounds(a11y).cloned();
                             plan_state.phase = ReceiveTransferPhase::ClickingReceive;
                             return Some(SelectedAction {
                                 action: actions::sequence(vec![
-                                    click_transfer_card(bounds, params.is_self),
+                                    click_transfer_card(bounds, list_b.as_ref(), params.is_self),
                                     actions::wait_short(),
                                 ]),
                                 frame: identified
@@ -663,8 +686,8 @@ mod tests {
             height: 111.0,
         };
 
-        let incoming = click_transfer_card(&bounds, false);
-        let outgoing = click_transfer_card(&bounds, true);
+        let incoming = click_transfer_card(&bounds, None, false);
+        let outgoing = click_transfer_card(&bounds, None, true);
 
         match incoming {
             Action::ClickCoords { x, y } => {
@@ -682,6 +705,59 @@ mod tests {
                 assert_eq!(y, 561.0);
             }
             _ => panic!("expected outgoing click coords"),
+        }
+    }
+
+    #[test]
+    fn transfer_card_click_clipped_to_visible_viewport() {
+        // Regression for 2026-05-28 APEX_GLORY bug: bubble partially scrolled
+        // off the top of the Messages list, raw center y landed above the
+        // viewport → click missed → ClickingReceive timed out.
+        let bubble = Bounds {
+            x: 404.0,
+            y: 44.0,
+            width: 704.0,
+            height: 111.0,
+        };
+        let list = Bounds {
+            x: 404.0,
+            y: 101.0,
+            width: 704.0,
+            height: 490.0,
+        };
+
+        let action = click_transfer_card(&bubble, Some(&list), false);
+        match action {
+            Action::ClickCoords { x: _, y } => {
+                // Must land inside the Messages viewport.
+                assert!(y >= 101.0, "y={y} should be >= list top (101)");
+                assert!(y <= 591.0, "y={y} should be <= list bottom (591)");
+                // And inside the bubble's visible slice [101, 155].
+                assert!(y <= 155.0, "y={y} should be inside visible bubble top half");
+            }
+            _ => panic!("expected click coords"),
+        }
+    }
+
+    #[test]
+    fn transfer_card_click_unclipped_when_bubble_in_view() {
+        // No regression on the happy path: bubble fully inside viewport →
+        // click_y is the geometric center of the bubble, same as before.
+        let bubble = Bounds {
+            x: 273.0,
+            y: 505.0,
+            width: 1004.0,
+            height: 111.0,
+        };
+        let list = Bounds {
+            x: 273.0,
+            y: 100.0,
+            width: 704.0,
+            height: 700.0,
+        };
+        match click_transfer_card(&bubble, Some(&list), false) {
+            Action::ClickCoords { x: _, y } => assert_eq!(y, 561.0),
+            _ => panic!("expected click coords"),
         }
     }
 
