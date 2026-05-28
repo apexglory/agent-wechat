@@ -254,6 +254,26 @@ impl Plan for ReceiveTransferPlan {
     ) -> Option<SelectedAction> {
         let main_state_id = identified.main_window.as_ref().map(|m| m.state_id.as_str());
 
+        tracing::info!(
+            "[receive_transfer] enter chat_id={} amount={:?} phase={} main={:?} popup={} opened_username={:?} opened_name={:?} find_attempts={} reopen_attempts={}",
+            params.chat_id,
+            params.amount_text,
+            match plan_state.phase {
+                ReceiveTransferPhase::OpeningChat => "OpeningChat",
+                ReceiveTransferPhase::ClickingTransfer => "ClickingTransfer",
+                ReceiveTransferPhase::ClickingReceive => "ClickingReceive",
+                ReceiveTransferPhase::WaitingSuccess => "WaitingSuccess",
+                ReceiveTransferPhase::ClosingSuccess => "ClosingSuccess",
+                ReceiveTransferPhase::Done => "Done",
+            },
+            main_state_id,
+            identified.popup.as_ref().map(|p| p.state_id.as_str()).unwrap_or("none"),
+            state.main_window.opened_chat_username,
+            state.main_window.opened_chat_name,
+            plan_state.find_attempts,
+            plan_state.reopen_attempts,
+        );
+
         // Dismiss other popups if unexpected
         if state.popup.is_some()
             && identified.popup.is_some()
@@ -275,7 +295,11 @@ impl Plan for ReceiveTransferPlan {
             match plan_state.phase {
                 ReceiveTransferPhase::OpeningChat => {
                     if main_state_id != Some("chat") && main_state_id != Some("chat_open") {
-                        return None; // Wait for app to be ready
+                        tracing::warn!(
+                            "[receive_transfer] None@OpeningChat: main_state_id={:?} not in (chat, chat_open)",
+                            main_state_id
+                        );
+                        return None;
                     }
 
                     if main_state_id == Some("chat_open")
@@ -303,8 +327,20 @@ impl Plan for ReceiveTransferPlan {
                     let result = open_chat(&params.chat_id, force, click_xy).await;
 
                     if !result.ok {
-                        return None; // open_chat failed
+                        tracing::warn!(
+                            "[receive_transfer] None@OpeningChat: open_chat failed for {}: error={:?} skipped={:?}",
+                            params.chat_id,
+                            result.error,
+                            result.skipped
+                        );
+                        return None;
                     }
+                    tracing::info!(
+                        "[receive_transfer] open_chat ok for {}: skipped={:?} username={:?}",
+                        params.chat_id,
+                        result.skipped,
+                        result.username
+                    );
 
                     let skipped = result.skipped.unwrap_or(false);
                     plan_state.open_result = Some(result);
@@ -324,6 +360,10 @@ impl Plan for ReceiveTransferPlan {
 
                 ReceiveTransferPhase::ClickingTransfer => {
                     if main_state_id != Some("chat_open") {
+                        tracing::warn!(
+                            "[receive_transfer] None@ClickingTransfer: main_state_id={:?} not chat_open",
+                            main_state_id
+                        );
                         return None;
                     }
 
@@ -377,6 +417,10 @@ impl Plan for ReceiveTransferPlan {
 
                     plan_state.find_attempts += 1;
                     if plan_state.find_attempts > 12 {
+                        tracing::warn!(
+                            "[receive_transfer] None@ClickingTransfer: find_attempts exceeded for chat={} amount={:?}",
+                            params.chat_id, params.amount_text
+                        );
                         return None;
                     }
 
@@ -430,6 +474,9 @@ impl Plan for ReceiveTransferPlan {
                     if let Some((btn, frame)) = find_accept_button(a11y) {
                         if let Some(bounds) = &btn.bounds {
                             if plan_state.receive_attempts >= 5 {
+                                tracing::warn!(
+                                    "[receive_transfer] None@ClickingReceive: receive_attempts>=5 (button found but giving up)"
+                                );
                                 return None;
                             }
                             plan_state.receive_attempts += 1;
@@ -451,7 +498,9 @@ impl Plan for ReceiveTransferPlan {
 
                     plan_state.receive_attempts += 1;
                     if plan_state.receive_attempts > 20 {
-                        // Timeout waiting for popup
+                        tracing::warn!(
+                            "[receive_transfer] None@ClickingReceive: timeout waiting for accept button popup"
+                        );
                         return None;
                     }
 
@@ -485,6 +534,9 @@ impl Plan for ReceiveTransferPlan {
 
                     plan_state.success_attempts += 1;
                     if plan_state.success_attempts > 20 {
+                        tracing::warn!(
+                            "[receive_transfer] None@WaitingSuccess: success_attempts>20, no success/closeable state observed"
+                        );
                         return None;
                     }
 
@@ -552,6 +604,9 @@ impl Plan for ReceiveTransferPlan {
 
                     plan_state.close_attempts += 1;
                     if plan_state.close_attempts > 10 {
+                        tracing::warn!(
+                            "[receive_transfer] None@ClosingSuccess: close_attempts>10"
+                        );
                         return None;
                     }
 
@@ -564,7 +619,10 @@ impl Plan for ReceiveTransferPlan {
                     });
                 }
 
-                ReceiveTransferPhase::Done => return None,
+                ReceiveTransferPhase::Done => {
+                    tracing::info!("[receive_transfer] phase=Done, plan exits with received={}", plan_state.received);
+                    return None;
+                }
             }
         }
     }
