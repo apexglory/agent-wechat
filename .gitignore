@@ -52,3 +52,4 @@ wechat_files/
 docker-compose.override.yml
 docker-compose.override.yaml
 docker-compose.yml.bak.*
+img.png
