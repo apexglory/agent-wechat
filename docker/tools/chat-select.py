@@ -362,12 +362,26 @@ function ptrToPattern(p) {{
     return hex.join(" ");
 }}
 
-// Step 1: Find manager via vtable scan
+// Step 1: Find manager via vtable scan.
+//
+// IMPORTANT: we must scan EVERY rw- range. Earlier versions skipped
+// ranges > 200 MB as a perf heuristic, but with many popped-out chat
+// windows the main heap arena can balloon past that and the manager
+// silently moves into the skipped chunk → "No sessions found" failures
+// that "go away on wechat restart" without any obvious explanation.
+// Frida's scanSync is fast enough that scanning ~1-3 GB total rw-
+// memory stays under our 45 s timeout in practice.
 var vtPattern = ptrToPattern(MANAGER_VT);
 var manager = null;
+var rangesScanned = 0;
+var rangesTotal = 0;
+var bytesScanned = 0;
 
 Process.enumerateRanges("rw-").forEach(function(range) {{
-    if (manager || range.size > 200*1024*1024) return;
+    rangesTotal++;
+    if (manager) return;
+    rangesScanned++;
+    bytesScanned += range.size;
     try {{
         Memory.scanSync(range.base, range.size, vtPattern).forEach(function(hit) {{
             if (manager) return;
@@ -381,6 +395,7 @@ Process.enumerateRanges("rw-").forEach(function(range) {{
         }});
     }} catch(e) {{}}
 }});
+console.log("SCAN ranges=" + rangesScanned + "/" + rangesTotal + " bytes=" + bytesScanned);
 
 if (!manager) {{
     console.log("ERROR: manager not found via vtable scan");
@@ -424,12 +439,14 @@ if (!manager) {{
 }}
 """)
 
+    last_frida_lines = []
     for attempt in range(3):
         if attempt > 0:
             log(f"[chat-select] Enumerate retry {attempt}...")
             time.sleep(2)
         log(f"[chat-select] Running Frida enumerate script (attempt {attempt})...")
         lines = run_frida_script(pid, "/tmp/_cs_enum.js", timeout=45)
+        last_frida_lines = lines
         # Parse raw sessions from Frida output (raw vector index -> username)
         raw_sessions = []  # [(raw_index, username), ...] in vector order
         vector_base = None
@@ -472,7 +489,21 @@ if (!manager) {{
             log(f"[chat-select] Filtered: {len(sessions)} sessions (excluded {gh_count} official accounts)")
 
             return sessions, vector_base, vector_count, current_sel
+
+    # All retries exhausted. Surface the last Frida output so callers can
+    # see WHICH stage failed (manager scan? vector pointers? validation?)
+    # — silent "No sessions found" left us guessing for hours.
+    log("[chat-select] enumerate failed after 3 retries; last Frida output:")
+    diag_lines = last_frida_lines[-30:]
+    for line in diag_lines:
+        log(f"[chat-select]   frida> {line}")
+    # Stash for the caller to attach to the result JSON.
+    global _LAST_FRIDA_DIAG
+    _LAST_FRIDA_DIAG = diag_lines
     return {}, None, 0, None
+
+
+_LAST_FRIDA_DIAG = []
 
 
 def select_by_index(pid, profile, target_index, click_coords, vector_base, vector_count):
@@ -614,7 +645,11 @@ def main():
     log("[chat-select] Enumerating sessions...")
     sessions, vector_base, vector_count, current_sel = enumerate_sessions(pid, profile)
     if not sessions:
-        result_json(False, error="No sessions found. Is WeChat logged in with chats visible?")
+        result_json(
+            False,
+            error="No sessions found. Is WeChat logged in with chats visible?",
+            frida_diag=_LAST_FRIDA_DIAG,
+        )
 
     # --list mode
     if positional[0] == "--list":

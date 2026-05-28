@@ -12,6 +12,11 @@ pub struct OpenChatResult {
     pub skipped: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Captured Frida script output on enumerate failure — lets the caller
+    /// log exactly which stage of the session-enum dance broke (manager
+    /// scan vs vector pointers vs validation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frida_diag: Option<Vec<String>>,
 }
 
 /// Open a chat in the WeChat UI using the chat-select tool.
@@ -53,5 +58,6 @@ pub async fn open_chat(chat_id: &str, force: bool, click_xy: Option<(f64, f64)>)
         } else {
             result.stderr
         }),
+        frida_diag: None,
     }
 }

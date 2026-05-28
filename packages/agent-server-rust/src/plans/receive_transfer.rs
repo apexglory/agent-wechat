@@ -328,10 +328,11 @@ impl Plan for ReceiveTransferPlan {
 
                     if !result.ok {
                         tracing::warn!(
-                            "[receive_transfer] None@OpeningChat: open_chat failed for {}: error={:?} skipped={:?}",
+                            "[receive_transfer] None@OpeningChat: open_chat failed for {}: error={:?} skipped={:?} frida_diag={:?}",
                             params.chat_id,
                             result.error,
-                            result.skipped
+                            result.skipped,
+                            result.frida_diag,
                         );
                         return None;
                     }
