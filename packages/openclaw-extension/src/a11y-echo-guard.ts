@@ -78,9 +78,20 @@ export const a11yChatBottom = new Map<string, ChatBottomMarker>();
 
 export function normalizeBubbleText(s: string): string {
   // WeChat tends to append "\n " to bubble labels; long bubbles are also
-  // truncated in atspi. Collapse runs of whitespace to a single space so
-  // recordings and a11y reads compare consistently.
-  return s.replace(/\s+/g, " ").trim();
+  // truncated in atspi. Normalize so an a11y read and the WCDB content
+  // compare equal even for SHORT messages (e.g. "饿了"), where bubblesMatch
+  // requires exact post-normalization equality (no prefix tolerance < 12 chars):
+  //   - NFC so composed/decomposed Unicode forms match,
+  //   - strip zero-width chars + BOM (a11y sometimes injects U+200B/U+FEFF
+  //     that the WCDB content doesn't carry),
+  //   - strip C0/C1 control bytes (keep \t \n \r — folded by the collapse below),
+  //   - collapse runs of whitespace to a single space.
+  return s
+    .normalize("NFC")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 export function bubblesMatch(a: string, b: string): boolean {
@@ -154,6 +165,46 @@ export function consumeRecent(
   for (let i = 0; i < arr.length; i++) {
     const e = arr[i];
     if (e.ts >= cutoff && bubblesMatch(e.text, text)) {
+      arr.splice(i, 1);
+      if (arr.length === 0) map.delete(key);
+      else map.set(key, arr);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Slack for clock granularity between the WCDB create_time (Unix SECONDS, so
+// floored — can read up to ~1 s earlier than the real send) and the gateway's
+// Date.now() fast-path dispatch stamp. Kept small so a genuine fast repeat
+// isn't swallowed; the consume-once semantics is the primary repeat guard.
+export const A11Y_TS_EPSILON_MS = 2_000;
+
+// Like consumeRecent, but gates on the WCDB message's own create_time instead
+// of a wall-clock receive window. Suppress iff a matching a11y-dispatched entry
+// exists AND the DB row was SENT at-or-before that dispatch (+ epsilon).
+//
+// Why this is more robust than consumeRecent's `e.ts >= now - windowMs`:
+// WCDB's batched flush can surface a row long after the fast-path dispatched it
+// (observed 44 s; can exceed the old 3-min window under load → the entry had
+// expired → the row dispatched a second time). create_time does NOT move with
+// flush lag — for the SAME message it is always ≤ the dispatch stamp — so this
+// check is immune to how late the row lands. A genuine LATER repeat carries a
+// create_time well past the dispatch stamp, so it still falls through and
+// dispatches (preserving the "2" → reply → "2" case). cleanupRecent's 30-min
+// GC bounds memory; the timestamp gate, not the GC window, decides matches.
+export function consumeByCreateTime(
+  map: Map<string, RecentEntry[]>,
+  key: string,
+  text: string,
+  msgCreateTimeMs: number,
+  epsilonMs: number = A11Y_TS_EPSILON_MS,
+): boolean {
+  const arr = map.get(key);
+  if (!arr) return false;
+  for (let i = 0; i < arr.length; i++) {
+    const e = arr[i];
+    if (msgCreateTimeMs <= e.ts + epsilonMs && bubblesMatch(e.text, text)) {
       arr.splice(i, 1);
       if (arr.length === 0) map.delete(key);
       else map.set(key, arr);

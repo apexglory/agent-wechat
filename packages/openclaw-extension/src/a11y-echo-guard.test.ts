@@ -4,9 +4,12 @@ import {
   a11yChatBottom,
   a11yDispatchedContent,
   a11yPendingDbConfirm,
+  bubblesMatch,
+  consumeByCreateTime,
   consumeRecent,
   hasUnconsumedEntries,
   noteOutboundText,
+  normalizeBubbleText,
   recentContains,
   recentlySentReplies,
   recordRecent,
@@ -75,4 +78,34 @@ test("consumeRecent on identical-text repeats suppresses exactly N rows (regress
   assert.equal(consumeRecent(a11yDispatchedContent, wxid, "在么"), true);
   // Fourth DB row finds no entry → not suppressed (a genuine new "在么").
   assert.equal(consumeRecent(a11yDispatchedContent, wxid, "在么"), false);
+});
+
+test("normalizeBubbleText makes a11y/WCDB short text compare equal (A1)", () => {
+  // a11y injects a zero-width space + trailing newline; WCDB content is clean.
+  // Short text has NO prefix tolerance in bubblesMatch, so they must normalize
+  // to byte-identical or the DB-race dedup misses → double dispatch of "饿了".
+  const a11yRead = normalizeBubbleText("\u997f\u200b\u4e86\n ");
+  const dbContent = normalizeBubbleText("饿了");
+  assert.equal(a11yRead, "饿了");
+  assert.equal(a11yRead, dbContent);
+  assert.equal(bubblesMatch(a11yRead, dbContent), true);
+  // NFC: composed vs decomposed Unicode forms normalize equal ("é").
+  assert.equal(normalizeBubbleText("cafe\u0301"), normalizeBubbleText("caf\u00e9"));
+});
+
+test("consumeByCreateTime gates on WCDB create_time, immune to flush lag (A2)", () => {
+  const wxid = "wxid_test_ctime";
+  recordRecent(a11yDispatchedContent, wxid, "饿了");
+  const ts = a11yDispatchedContent.get(wxid)![0]!.ts;
+  // Same message: WCDB create_time is at/just-before the fast-path dispatch
+  // stamp. Even if the row only surfaces minutes later (flush lag affects when
+  // we SEE it, not create_time), it must still be suppressed.
+  assert.equal(consumeByCreateTime(a11yDispatchedContent, wxid, "饿了", ts - 500), true);
+  // A genuine later repeat (create_time well past the dispatch stamp) is NOT
+  // suppressed...
+  recordRecent(a11yDispatchedContent, wxid, "饿了");
+  const ts2 = a11yDispatchedContent.get(wxid)![0]!.ts;
+  assert.equal(consumeByCreateTime(a11yDispatchedContent, wxid, "饿了", ts2 + 60_000), false);
+  // ...and the entry remains for its real (same-time) DB row.
+  assert.equal(consumeByCreateTime(a11yDispatchedContent, wxid, "饿了", ts2), true);
 });

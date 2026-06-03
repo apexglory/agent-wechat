@@ -177,57 +177,66 @@ pub async fn send_to_frame(
             return err(format!("xdotool Return failed: {}", r.stderr));
         }
 
-        // Post-send verify: re-dump a11y and check the message actually landed.
-        // xdotool reports exit 0 whether or not wechat consumed the keystroke —
-        // observed 2026-05-25 on wxid_xxoxed61kmwv22: five sendFast calls in a
-        // row reported ok but wechat never registered the Enter (focus race,
+        // Post-send verify: re-dump a11y and confirm the message actually
+        // landed. xdotool reports exit 0 whether or not wechat consumed the
+        // keystroke — observed 2026-05-25 on wxid_xxoxed61kmwv22: five sendFast
+        // calls reported ok but wechat never registered the Enter (focus race,
         // input box hadn't quite focused, etc.), so the bubble never appeared
         // in wcdb and the caller's marker logic re-dispatched the inbound msg
         // for ~3 minutes. Without this check the failure is invisible upstream.
         //
-        // Best-effort: an a11y dump failure or a missing frame doesn't fail the
-        // send (we don't know the truth). We only flip to ok=false when we can
-        // see that the input box still holds our text OR the bottom bubble in
-        // the Messages list doesn't match what we just sent.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Ok(post_tree) = get_a11y_app("wechat", options).await {
-            if let Some(post_frame) = find_frame(&post_tree, frame_name) {
-                // Check 1: input box should be empty (wechat clears it on send).
-                if let Some(post_input) = find_editable_text(post_frame) {
-                    let remaining = post_input.name.trim();
-                    let sent_trim = text.trim();
-                    if !remaining.is_empty()
-                        && (remaining == sent_trim || remaining.contains(sent_trim))
-                    {
-                        return err(format!(
-                            "post-send verify failed: input still holds text after Return ({:?})",
-                            remaining.chars().take(40).collect::<String>()
-                        ));
-                    }
-                }
-                // Check 2: the bottom of the Messages list should be the text we
-                // just sent (modulo a11y truncation of long bubbles).
-                if let Some(msg_list) = find_messages_list(post_frame) {
-                    if let Some(children) = &msg_list.children {
-                        let last_bubble = children
-                            .iter()
-                            .rev()
-                            .map(|c| c.name.as_str())
-                            .find(|n| !is_timestamp_row(n));
-                        if let Some(bubble) = last_bubble {
-                            let bubble_norm = normalize_bubble(bubble);
-                            let sent_norm = normalize_bubble(text);
-                            if !bubbles_match(&bubble_norm, &sent_norm) {
-                                return err(format!(
-                                    "post-send verify failed: bottom bubble {:?} doesn't match sent {:?}",
-                                    bubble_norm.chars().take(40).collect::<String>(),
-                                    sent_norm.chars().take(40).collect::<String>()
-                                ));
-                            }
-                        }
-                    }
-                }
+        // Poll with early exit instead of a fixed 500ms wait: most sends land
+        // within ~150ms, so the first clean poll (input cleared AND bottom
+        // bubble matches) returns ok and skips the rest of the wait. Only if the
+        // LAST poll still shows an affirmative failure do we flip to ok=false.
+        // Best-effort: an a11y dump failure or a missing frame means we can't
+        // verify → bail to ok (same leniency as the old single-shot check).
+        let sent_trim = text.trim();
+        let sent_norm = normalize_bubble(text);
+        let mut verify_failure: Option<String> = None;
+        for delay in [120u64, 150, 200] {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            let Ok(post_tree) = get_a11y_app("wechat", options).await else {
+                verify_failure = None;
+                break;
+            };
+            let Some(post_frame) = find_frame(&post_tree, frame_name) else {
+                verify_failure = None;
+                break;
+            };
+            // Check 1: input box should be empty (wechat clears it on send).
+            let input_dirty = find_editable_text(post_frame).is_some_and(|post_input| {
+                let remaining = post_input.name.trim();
+                !remaining.is_empty()
+                    && (remaining == sent_trim || remaining.contains(sent_trim))
+            });
+            // Check 2: bottom of the Messages list should be the text we just
+            // sent (modulo a11y truncation). Absent list/bubble → unknown,
+            // treated as "not a mismatch" so it doesn't block early exit.
+            let bubble_mismatch = find_messages_list(post_frame)
+                .and_then(|l| l.children.as_ref())
+                .and_then(|children| {
+                    children
+                        .iter()
+                        .rev()
+                        .map(|c| c.name.as_str())
+                        .find(|n| !is_timestamp_row(n))
+                })
+                .is_some_and(|bubble| !bubbles_match(&normalize_bubble(bubble), &sent_norm));
+            if !input_dirty && !bubble_mismatch {
+                verify_failure = None; // confirmed clean → done early
+                break;
             }
+            // Not yet confirmed — record the reason and retry; the bubble may
+            // simply not have rendered yet. The last iteration's reason sticks.
+            verify_failure = Some(if input_dirty {
+                "input still holds text after Return".to_string()
+            } else {
+                "bottom bubble doesn't match sent text".to_string()
+            });
+        }
+        if let Some(reason) = verify_failure {
+            return err(format!("post-send verify failed: {reason}"));
         }
 
         FrameSendResult {
@@ -239,14 +248,40 @@ pub async fn send_to_frame(
     }
     .await;
 
-    // Restore focus to whatever was active before we activated the popped-out
-    // frame. Done unconditionally — even on success, leaving focus on a
-    // popped-out frame breaks the next outbound send if it routes through the
-    // slow path on a different chat. Best-effort: a cleanup failure shouldn't
+    // Restore focus after the send. We MUST leave focus on a sane window: the
+    // slow-path fallback (chat_select / SendMessagePlan) drives the MAIN wechat
+    // window, so leaving focus on this popped-out frame breaks the next
+    // outbound send that routes through it (the "No action selected" loop,
+    // qiafan2-bot Server A 2026-05-25).
+    //
+    // B1 (transitional): retarget the restore to the MAIN window instead of
+    // `prior_active`. prior_active was "whatever was focused before", which is
+    // often a *different* popped-out chat frame — the user-visible "reply jumps
+    // to a random sub-window" surprise, and a worse landing spot for the slow
+    // path than the main window. Resolve the main window by its frame name
+    // ("Weixin"); if that can't be uniquely resolved (different WeChat UI
+    // locale/version → 0 or >1 matches), fall back to prior_active so there is
+    // NO behavior change from before. Best-effort: a cleanup failure must not
     // override the real send result.
-    if let Some(prev) = prior_active.as_deref() {
-        if prev != wid_for_restore {
-            let _ = exec_command("xdotool", &["windowactivate", "--sync", prev], options).await;
+    let restore_target: Option<String> = {
+        let r = exec_command("xdotool", &["search", "--name", "^Weixin$"], options).await;
+        let main_ids: Vec<String> = if r.exit_code == 0 {
+            r.stdout
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        match main_ids.len() {
+            1 => main_ids.into_iter().next(),
+            _ => prior_active.clone(),
+        }
+    };
+    if let Some(target) = restore_target.as_deref() {
+        if target != wid_for_restore {
+            let _ = exec_command("xdotool", &["windowactivate", "--sync", target], options).await;
         }
     }
 

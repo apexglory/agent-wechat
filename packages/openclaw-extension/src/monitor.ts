@@ -43,7 +43,7 @@ import {
   bubblesMatch,
   cleanupRecent,
   clearOutboundText,
-  consumeRecent,
+  consumeByCreateTime,
   hasUnconsumedEntries,
   normalizeBubbleText,
   noteOutboundText,
@@ -146,8 +146,23 @@ function nextA11yLocalId(): number {
   return id;
 }
 
+// These match WeChat's ENGLISH accessibility placeholder labels for non-text
+// bubbles. The a11y fast-path SKIPS them and leaves the real message to the DB
+// catch-up path, which has the true msg.kind + the XML payload (amount, memo,
+// lat/lng, media bytes) that the a11y label throws away.
+//
+// The whole a11y pipeline already assumes English AX labels (see the
+// "unread message(s)" parsing in agent-server's wechat_a11y.rs). If WeChat's UI
+// language or these strings change, these skips silently stop firing — confirm
+// against a live a11y dump.
+//
+// Bias: OVER-matching here is safe under the current dual-source design — a
+// skipped bubble is still delivered (a few seconds later) by the DB path.
+// UNDER-matching is the bug: the placeholder gets dispatched as a text message
+// AND the DB path re-sends the real message (duplicate + garbage text).
 const A11Y_TIMESTAMP_ROW_RE = /^\d{1,2}:\d{2}(?::\d{2})?$/;
-const A11Y_MEDIA_TAG_RE = /\[(?:Image|Audio|Video|File|Transfer|Red\s*packet)/i;
+const A11Y_MEDIA_TAG_RE =
+  /\[(?:Image|Photo|Audio|Voice|Video|File|Transfer|Red\s*packet|Sticker|Emoji|Link|Mini\s*Program|Music|Location|Card|Contact\s*Card|Chat\s*History|Channels?|Note|Live)/i;
 const A11Y_AUDIO_NAME_RE = /^Audio\d+/i;
 
 // History context markers (match openclaw's built-in markers)
@@ -933,12 +948,14 @@ async function prepareMessage(
     return null;
   }
 
-  // Skip if already dispatched via a11y fast path. consumeRecent removes the
-  // matched entry so it suppresses exactly ONE WCDB row — a user who later
+  // Skip if already dispatched via a11y fast path. consumeByCreateTime removes
+  // the matched entry so it suppresses exactly ONE WCDB row — a user who later
   // repeats the same text isn't silently dropped (the repeat finds no entry
-  // and dispatches). The window is generous (minutes) because WCDB's batched
-  // flush can lag well past the old 30s window (observed 44s), which is what
-  // double-dispatched the message before this fix.
+  // and dispatches). It gates on the WCDB row's OWN create_time vs the a11y
+  // dispatch stamp, NOT on a wall-clock receive window: WCDB's batched flush
+  // can surface this row long after the fast-path dispatched it (observed 44s,
+  // can exceed the old 3-min window under load → double-dispatch). create_time
+  // doesn't move with flush lag, so this is immune to how late the row lands.
   //
   // Always also consume a11yPendingDbConfirm (whether or not the dispatch-
   // content ring suppresses): the empty-fetch defer in processUnreadChat is
@@ -949,15 +966,13 @@ async function prepareMessage(
   // a11yDispatchedContent while still clearing the pending defer.
   if (msg.kind === "text" && msg.content) {
     const norm = normalizeBubbleText(msg.content);
-    consumeRecent(a11yPendingDbConfirm, chatId, norm, A11Y_DB_RACE_WINDOW_MS);
-    if (
-      consumeRecent(
-        a11yDispatchedContent,
-        chatId,
-        norm,
-        A11Y_DB_RACE_WINDOW_MS,
-      )
-    ) {
+    // create_time is RFC3339 from WCDB (seconds granularity). If it can't be
+    // parsed, fall back to "now" so the entry still has a chance to match a
+    // freshly-flushed row (consume-once remains the backstop against dupes).
+    const parsed = Date.parse(msg.timestamp);
+    const msgCreateTimeMs = Number.isNaN(parsed) ? Date.now() : parsed;
+    consumeByCreateTime(a11yPendingDbConfirm, chatId, norm, msgCreateTimeMs);
+    if (consumeByCreateTime(a11yDispatchedContent, chatId, norm, msgCreateTimeMs)) {
       log?.info?.(
         `[wechat:${liveAccount.accountId}] Skipping msg ${msg.localId} — already dispatched via a11y fast path`,
       );
