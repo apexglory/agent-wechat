@@ -36,8 +36,24 @@ type Logger = {
 
 type DispatchFn<T> = (segment: T[]) => Promise<boolean>;
 
+// Per-message callback fired once the merged dispatch that carried this
+// message settles, with the dispatch outcome (true = dispatchSegment returned
+// true). This is what lets callers commit their "message handled" bookkeeping
+// (lastSeenId advance, a11y dedup suppress-ring) ONLY after the async dispatch
+// actually succeeds — instead of speculatively at enqueue time, which silently
+// drops the message if the dispatch later fails or hangs. Fires for EVERY
+// drained message regardless of which closure won the flush, so cross-path
+// merges (a11y fast-path + DB catch-up sharing a session key) each settle
+// their own bookkeeping correctly.
+type SettleFn = (ok: boolean) => void;
+
+interface PendingItem<T> {
+  value: T;
+  onSettled?: SettleFn;
+}
+
 interface SessionState<T> {
-  pending: T[];
+  pending: PendingItem<T>[];
   debounceTimer: ReturnType<typeof setTimeout> | undefined;
   inflightDispatch: Promise<boolean> | undefined;
   // The dispatch closure captures the caller's context (client, chat, cfg
@@ -109,15 +125,17 @@ async function runFlush<T>(
   // Drain everything currently pending. New messages arriving during the
   // dispatch will accumulate in the (now empty) pending list and get a
   // fresh debounce window in the finally block below.
-  const segment = state.pending;
+  const drained = state.pending;
   const dispatchFn = state.latestDispatchFn;
   state.pending = [];
   state.latestDispatchFn = undefined;
 
-  if (!dispatchFn || segment.length === 0) {
+  if (!dispatchFn || drained.length === 0) {
     maybeCleanup(sessionKey);
     return;
   }
+
+  const segment = drained.map((d) => d.value);
 
   if (segment.length > 1) {
     log?.info?.(
@@ -137,10 +155,24 @@ async function runFlush<T>(
   })();
   state.inflightDispatch = work;
 
+  let ok = false;
   try {
-    await work;
+    ok = await work;
   } finally {
     state.inflightDispatch = undefined;
+    // Settle every drained message with the dispatch outcome BEFORE re-arming,
+    // so callers commit/roll-back their bookkeeping (lastSeenId, dedup rings)
+    // exactly once per message and in lockstep with the real result. A settler
+    // that throws must not abort the rest or leave the session wedged.
+    for (const d of drained) {
+      try {
+        d.onSettled?.(ok);
+      } catch (err) {
+        log?.error?.(
+          `[inbound-coalesce] ${sessionKey}: onSettled threw: ${String(err)}`,
+        );
+      }
+    }
     // New messages may have arrived while we were dispatching. Start a new
     // debounce window so they get a chance to coalesce too.
     if (state.pending.length > 0) {
@@ -168,15 +200,21 @@ export interface EnqueueOptions {
  * one debounce window. The closure should capture whatever transient
  * context (client, chat, cfg snapshot, policy) it needs at enqueue time;
  * the most recent dispatchFn passed for a given session wins.
+ *
+ * onSettled (optional) fires once, with the dispatch outcome, after the merged
+ * dispatch that carried THIS message settles — even if a later enqueue's
+ * dispatchFn is the one that actually ran the flush. Use it to commit
+ * per-message bookkeeping only on real success (see SettleFn).
  */
 export function enqueueCoalescedMessage<T>(
   sessionKey: string,
   message: T,
   dispatchFn: DispatchFn<T>,
   opts: EnqueueOptions,
+  onSettled?: SettleFn,
 ): void {
   const state = getOrCreateState<T>(sessionKey);
-  state.pending.push(message);
+  state.pending.push({ value: message, onSettled });
   state.latestDispatchFn = dispatchFn;
   armDebounceTimer<T>(sessionKey, opts.debounceMs, opts.log);
 }

@@ -211,3 +211,91 @@ test("most recent dispatchFn wins when multiple enqueue calls share a debounce w
   await __testForceFlush("sess-1", 9999);
   assert.deepEqual(calls, ["NEW:1,2"]);
 });
+
+test("onSettled fires for every drained message with ok=true on success", async () => {
+  const settled: Array<{ id: number; ok: boolean }> = [];
+  const dispatchFn = async (_segment: number[]) => true;
+
+  for (const id of [1, 2, 3]) {
+    enqueueCoalescedMessage("sess-1", id, dispatchFn, { debounceMs: 9999 }, (ok) =>
+      settled.push({ id, ok }),
+    );
+  }
+
+  await __testForceFlush("sess-1", 9999);
+  assert.deepEqual(
+    settled.sort((a, b) => a.id - b.id),
+    [
+      { id: 1, ok: true },
+      { id: 2, ok: true },
+      { id: 3, ok: true },
+    ],
+    "each enqueued message settles exactly once with the success outcome",
+  );
+});
+
+test("onSettled reports ok=false when the dispatch returns false", async () => {
+  const settled: Array<{ id: number; ok: boolean }> = [];
+  const dispatchFn = async (_segment: number[]) => false;
+
+  enqueueCoalescedMessage("sess-1", 1, dispatchFn, { debounceMs: 9999 }, (ok) =>
+    settled.push({ id: 1, ok }),
+  );
+  await __testForceFlush("sess-1", 9999);
+  assert.deepEqual(settled, [{ id: 1, ok: false }]);
+});
+
+test("onSettled reports ok=false when the dispatch throws", async () => {
+  const settled: boolean[] = [];
+  const dispatchFn = async (_segment: number[]) => {
+    throw new Error("boom");
+  };
+
+  enqueueCoalescedMessage("sess-1", 1, dispatchFn, { debounceMs: 9999 }, (ok) =>
+    settled.push(ok),
+  );
+  await __testForceFlush("sess-1", 9999);
+  assert.deepEqual(settled, [false], "a thrown dispatch settles as failure, not silently");
+});
+
+test("onSettled fires even when a LATER enqueue's closure wins the flush (cross-path merge)", async () => {
+  // Mirrors a11y-fast-path + DB-catch-up sharing a session key: the a11y
+  // enqueue's onSettled must still fire with the batch outcome even though the
+  // DB enqueue's dispatchFn is the one that actually ran.
+  const settled: Array<{ tag: string; ok: boolean }> = [];
+  const a11yFn = async (_s: number[]) => true; // never runs (superseded)
+  const dbFn = async (_s: number[]) => true; // wins (latest)
+
+  enqueueCoalescedMessage("sess-1", 1, a11yFn, { debounceMs: 9999 }, (ok) =>
+    settled.push({ tag: "a11y", ok }),
+  );
+  enqueueCoalescedMessage("sess-1", 2, dbFn, { debounceMs: 9999 }, (ok) =>
+    settled.push({ tag: "db", ok }),
+  );
+
+  await __testForceFlush("sess-1", 9999);
+  assert.deepEqual(
+    settled.sort((a, b) => a.tag.localeCompare(b.tag)),
+    [
+      { tag: "a11y", ok: true },
+      { tag: "db", ok: true },
+    ],
+    "both messages settle even though only the latest dispatchFn ran",
+  );
+});
+
+test("a settler that throws does not abort the other settlers or wedge the session", async () => {
+  const settled: number[] = [];
+  const dispatchFn = async (_s: number[]) => true;
+
+  enqueueCoalescedMessage("sess-1", 1, dispatchFn, { debounceMs: 9999 }, () => {
+    throw new Error("settler boom");
+  });
+  enqueueCoalescedMessage("sess-1", 2, dispatchFn, { debounceMs: 9999 }, () =>
+    settled.push(2),
+  );
+
+  await __testForceFlush("sess-1", 9999);
+  assert.deepEqual(settled, [2], "the second settler still ran despite the first throwing");
+  assert.equal(__testPeek("sess-1"), null, "session state is cleaned up, not wedged");
+});

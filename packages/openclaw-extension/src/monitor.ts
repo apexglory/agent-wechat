@@ -44,7 +44,9 @@ import {
   cleanupRecent,
   clearOutboundText,
   consumeByCreateTime,
+  consumeRecent,
   hasUnconsumedEntries,
+  matchesByCreateTime,
   normalizeBubbleText,
   noteOutboundText,
   recentContains,
@@ -245,6 +247,24 @@ async function dispatchA11yTextMessage(
     return;
   }
 
+  // Commit the DB-suppress ring ONLY when the dispatch actually succeeds, and
+  // clear the pending-confirm entry (seeded by the caller before this call) on
+  // failure so the DB catch-up stops deferring and recovers the message. This
+  // is the whole point of routing through onSettled rather than recording
+  // a11yDispatchedContent eagerly: a dispatch that fails or hangs must NOT
+  // leave a suppress entry that silently drops the real WCDB row.
+  const norm = normalizeBubbleText(content);
+  const settle = (ok: boolean): void => {
+    if (ok) {
+      recordRecent(a11yDispatchedContent, chatId, norm);
+    } else {
+      consumeRecent(a11yPendingDbConfirm, chatId, norm);
+      log?.info?.(
+        `[wechat:${liveAccount.accountId}] a11y fast-path dispatch did not land for ${chatId}; cleared pending so DB catch-up can recover: ${content.slice(0, 60)}`,
+      );
+    }
+  };
+
   const now = Date.now();
   const localId = nextA11yLocalId();
   const stubMsg: Message = {
@@ -279,7 +299,7 @@ async function dispatchA11yTextMessage(
     allowTextCommands &&
     core.channel.commands.isControlCommandMessage(pm.commandBody, cfg);
   if (isCtrl) {
-    await dispatchSegment(
+    const ok = await dispatchSegment(
       [pm],
       client,
       chatId,
@@ -292,6 +312,7 @@ async function dispatchA11yTextMessage(
       log,
       undefined,
     );
+    settle(ok);
   } else {
     const sessionKey = `${liveAccount.accountId}::${chatId}`;
     enqueueCoalescedMessage<ProcessedMessage>(
@@ -313,6 +334,9 @@ async function dispatchA11yTextMessage(
         );
       },
       { debounceMs: INBOUND_COALESCE_DEBOUNCE_MS, log },
+      // onSettled — fires with the real dispatch outcome (after the debounce +
+      // serialized dispatch), even if a later enqueue's closure ran the flush.
+      settle,
     );
   }
 }
@@ -773,12 +797,15 @@ export async function startWeChatMonitor(
               lastHandledIdx = eligibleIdx;
               continue;
             }
-            // Pending-DB-confirm is recorded BEFORE dispatch so the empty-
-            // fetch path in processUnreadChat defers its lastSeenId advance
-            // until the matching Msg_* row lands — WCDB sometimes flushes
-            // session.db (lastMsgLocalId ↑) before the Msg_* row appears,
-            // and advancing here would silently drop the row when it
-            // arrives. Cleared in prepareMessage when the DB row is seen.
+            // Pending-DB-confirm is recorded BEFORE dispatch so the DB
+            // catch-up DEFERS this row (and its lastSeenId advance) until the
+            // dispatch settles: the empty-fetch path waits for the Msg_* row,
+            // and the non-empty path holds the landed row (see processUnreadChat
+            // + matchesByCreateTime). a11yDispatchedContent is NOT recorded
+            // here — that now happens in dispatchA11yTextMessage's onSettled
+            // ONLY on a real successful dispatch, with the pending entry cleared
+            // on failure so the row recovers via the DB path instead of being
+            // silently suppressed by a speculative entry.
             recordRecent(a11yPendingDbConfirm, wxid, item.norm);
             log?.info?.(
               `[wechat:${account.accountId}] a11y fast-path dispatching to ${unreadChat.name} (unread=${unreadChat.unread}, marker=${markerFound ? "hit" : "miss"}): ${item.trimmed.slice(0, 60)}`,
@@ -786,23 +813,20 @@ export async function startWeChatMonitor(
             try {
               await dispatchA11yTextMessage(client, account, cfg, chat, item.trimmed, log);
             } catch (err) {
-              // Don't reseat marker past a failed candidate and don't drain
-              // the rest of the batch — the next a11y tick will retry from
-              // this point (preserving order, which the marker logic relies
-              // on). The a11yPendingDbConfirm entry stays live so empty-
-              // fetch keeps deferring; a11yDispatchedContent has NO entry
-              // for this candidate, so when the DB row eventually lands it
-              // goes through the normal path instead of being suppressed.
+              // Synchronous failure (policy resolve / enqueue threw) — the
+              // dispatch never scheduled, so onSettled will never fire. Clear
+              // the pending entry we just seeded so the DB catch-up stops
+              // deferring and recovers the message. Don't reseat the marker
+              // past this candidate and don't drain the rest of the batch —
+              // the next a11y tick retries from here (order matters for the
+              // marker logic).
+              consumeRecent(a11yPendingDbConfirm, wxid, item.norm);
               log?.error?.(
                 `[wechat:${account.accountId}] a11y fast-path dispatch failed: ${err}`,
               );
               dispatchFailed = true;
               break;
             }
-            // Successful dispatch — only NOW record into the DB-suppress
-            // ring so a failed dispatch doesn't cause the matching DB row
-            // to be silently dropped.
-            recordRecent(a11yDispatchedContent, wxid, item.norm);
             lastHandledIdx = eligibleIdx;
           }
 
@@ -1644,6 +1668,38 @@ async function processUnreadChat(
     `[wechat:${liveAccount.accountId}] ${chatId}: ${newMessages.length} new msg(s) to process`,
   );
 
+  // Defer-until-confirmed: if any just-landed row matches an a11y fast-path
+  // dispatch that is still in-flight (a11yPendingDbConfirm has it) and NOT yet
+  // confirmed (a11yDispatchedContent does not), hold the WHOLE batch — return
+  // without advancing lastSeenId — and retry next poll. This closes the race
+  // where a slow/hung fast-path dispatch lets the DB row through (double
+  // dispatch) or, with the old eager suppress-ring, swallowed it entirely.
+  //   - dispatch SUCCEEDS  → onSettled records a11yDispatchedContent → next
+  //     poll stops deferring and prepareMessage suppresses the row (single).
+  //   - dispatch FAILS     → onSettled clears the pending entry → next poll
+  //     stops deferring and dispatches the row here (recovery).
+  //   - dispatch HANGS     → pending stays, batch keeps deferring, lastSeenId
+  //     never advances → a restart re-fetches and re-delivers it. The match is
+  //     gated on the row's own create_time (immune to flush lag) and naturally
+  //     bounded by cleanupRecent's 30-min GC of the pending ring.
+  // Non-destructive on purpose: the pending entry is consumed exactly once,
+  // later, by prepareMessage's consumeByCreateTime when the row is processed.
+  for (const m of newMessages) {
+    if (m.kind !== "text" || !m.content) continue;
+    const norm = normalizeBubbleText(m.content);
+    const parsed = Date.parse(m.timestamp);
+    const ct = Number.isNaN(parsed) ? Date.now() : parsed;
+    if (
+      matchesByCreateTime(a11yPendingDbConfirm, chatId, norm, ct) &&
+      !matchesByCreateTime(a11yDispatchedContent, chatId, norm, ct)
+    ) {
+      log?.info?.(
+        `[wechat:${liveAccount.accountId}] ${chatId}: deferring batch (lastSeenId held) — fast-path dispatch in-flight/unconfirmed for: ${m.content.slice(0, 60)}`,
+      );
+      return;
+    }
+  }
+
   const hasNonTextMessages = requiresChatOpenForMessages(newMessages);
   const processed = hasNonTextMessages
     ? await runSerializedWeChatOperation(
@@ -1791,6 +1847,18 @@ async function processUnreadChat(
         );
       }
       // Fire-and-forget: allDispatched stays true so lastSeenId advances.
+      //
+      // KNOWN GAP (tracked follow-up — twin of the a11y dedup-timing fix):
+      // lastSeenId advances here at ENQUEUE time, before the coalesced
+      // dispatchSegment runs. A pure-DB-path message (one that never went
+      // through the a11y fast-path) whose coalesced dispatch later FAILS or
+      // HANGS is then silently lost — the row won't be re-fetched (lastSeenId
+      // already moved past it) and there's no further fallback channel. The
+      // a11y path is now recoverable via onSettled + defer-until-confirmed
+      // (see dispatchA11yTextMessage / the defer scan above); this path is
+      // not. Fixing it cleanly needs in-flight-localId dedup + advance-on-
+      // settle / rewind-on-failure, which changes lastSeenId advance
+      // semantics — deferred to its own change with dedicated tests.
     } else {
       const segments = hasControlCommandInWindow
         ? processed.map((pm) => [pm])

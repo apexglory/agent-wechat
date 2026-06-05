@@ -8,6 +8,7 @@ import {
   consumeByCreateTime,
   consumeRecent,
   hasUnconsumedEntries,
+  matchesByCreateTime,
   noteOutboundText,
   normalizeBubbleText,
   recentContains,
@@ -108,4 +109,25 @@ test("consumeByCreateTime gates on WCDB create_time, immune to flush lag (A2)", 
   assert.equal(consumeByCreateTime(a11yDispatchedContent, wxid, "饿了", ts2 + 60_000), false);
   // ...and the entry remains for its real (same-time) DB row.
   assert.equal(consumeByCreateTime(a11yDispatchedContent, wxid, "饿了", ts2), true);
+});
+
+test("matchesByCreateTime reports a match without consuming it (defer-until-confirmed)", () => {
+  const wxid = "wxid_test_match";
+  recordRecent(a11yPendingDbConfirm, wxid, "三杯奶茶");
+  const ts = a11yPendingDbConfirm.get(wxid)![0]!.ts;
+
+  // The landed DB row (create_time at/just-before the dispatch stamp) matches —
+  // and matching MUST be repeatable across polls, so it does not remove the
+  // entry the way consumeByCreateTime would.
+  assert.equal(matchesByCreateTime(a11yPendingDbConfirm, wxid, "三杯奶茶", ts - 500), true);
+  assert.equal(matchesByCreateTime(a11yPendingDbConfirm, wxid, "三杯奶茶", ts - 500), true);
+  assert.equal(a11yPendingDbConfirm.get(wxid)?.length, 1, "entry survives repeated matches");
+
+  // A genuine later repeat (create_time well past the dispatch stamp) does NOT
+  // match, so it isn't deferred.
+  assert.equal(matchesByCreateTime(a11yPendingDbConfirm, wxid, "三杯奶茶", ts + 60_000), false);
+  // No entry at all → no match.
+  assert.equal(matchesByCreateTime(a11yDispatchedContent, wxid, "三杯奶茶", ts), false);
+
+  consumeRecent(a11yPendingDbConfirm, wxid, "三杯奶茶");
 });

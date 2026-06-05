@@ -214,6 +214,27 @@ export function consumeByCreateTime(
   return false;
 }
 
+// Non-destructive twin of consumeByCreateTime: report whether a matching entry
+// exists WITHOUT removing it. Used by the DB catch-up path to decide whether to
+// DEFER a freshly-landed WCDB row (a fast-path dispatch for the same text is
+// still in-flight / unconfirmed) vs. process it. Must not consume, because the
+// same entry has to keep deferring across multiple polls until the dispatch
+// settles — and is then consumed exactly once by consumeByCreateTime when the
+// row is finally processed.
+export function matchesByCreateTime(
+  map: Map<string, RecentEntry[]>,
+  key: string,
+  text: string,
+  msgCreateTimeMs: number,
+  epsilonMs: number = A11Y_TS_EPSILON_MS,
+): boolean {
+  const arr = map.get(key);
+  if (!arr) return false;
+  return arr.some(
+    (e) => msgCreateTimeMs <= e.ts + epsilonMs && bubblesMatch(e.text, text),
+  );
+}
+
 // Record a bot outbound text so the a11y fast-path won't read its own bubble
 // back as a new inbound message. MUST be called by every outbound text path
 // (the monitor's inline reply AND OpenClaw's async outbound adapter), keyed by
