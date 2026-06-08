@@ -1,6 +1,41 @@
 import type { ResolvedWeChatAccount } from "./types.js";
-import { WeChatClient } from "@apexglory/agent-wechat2-shared";
+import { WeChatClient, type ReceivePaymentResult } from "@apexglory/agent-wechat2-shared";
 import { runSerializedWeChatOperation } from "./operation-queue.ts";
+
+// Receiving a transfer drives a single-shot UI plan in agent-server: it clicks
+// the transfer bubble EXACTLY ONCE per HTTP call and never re-clicks within a
+// run — ClickingReceive only waits for the accept dialog, then fast-fails to
+// release the global UI mutex (see receive_transfer.rs). So when the click is
+// ineffective (bubble was off-screen, stale bounds, missed hit, WCDB hadn't
+// surfaced the receipt yet) the ONLY way to re-click is a fresh call. That
+// fresh call used to come solely from the agent deciding to retry — unreliable
+// on a money path, so a transient miss could silently leave the money unclaimed
+// (observed 2026-06-04: 小水's ¥3.90 received ~8h late). Retry automatically
+// here instead: each attempt is a fresh HTTP call (so agent-server re-opens the
+// chat and re-clicks the bubble) with the UI mutex released in between.
+const RECEIVE_TRANSFER_MAX_ATTEMPTS = 3;
+const RECEIVE_TRANSFER_RETRY_DELAY_MS = 1500;
+
+// Outcomes a re-click can't fix — stop immediately rather than burn attempts.
+// (success is handled separately.) Everything else — TRANSFER_NOT_RECEIVED, the
+// plan getting stuck ("No action selected" / "Max steps reached"), or any
+// unknown error — is treated as a transient on-screen failure worth re-clicking.
+const TERMINAL_RECEIVE_ERRORS = new Set([
+  "TRANSFER_NOT_FOUND", // message isn't in the chat — re-clicking finds nothing
+  "MESSAGE_IS_NOT_TRANSFER", // wrong message kind
+  "TRANSFER_NOT_RECEIVABLE", // own outgoing transfer
+  "NOT_LOGGED_IN",
+  "No session available",
+]);
+
+function isTerminalReceiveResult(result: ReceivePaymentResult): boolean {
+  // agent-server short-circuits on is_received before re-running the plan, so a
+  // retry after a real (but mis-reported) success is safe — it returns success
+  // without a second click. We still stop on success here to avoid the delay.
+  return result.success || TERMINAL_RECEIVE_ERRORS.has(result.error ?? "");
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 function createClient(account: ResolvedWeChatAccount) {
   return new WeChatClient({
@@ -230,12 +265,29 @@ export function createWeChatReceiveTransferTool(account: ResolvedWeChatAccount) 
           account.accountId,
           chatId,
           `receive transfer in ${chatId}`,
-          () =>
-            client.receiveTransfer(
-              chatId,
-              transactionId,
-              localId,
-            ),
+          async () => {
+            let last: ReceivePaymentResult | undefined;
+            for (
+              let attempt = 1;
+              attempt <= RECEIVE_TRANSFER_MAX_ATTEMPTS;
+              attempt++
+            ) {
+              last = await client.receiveTransfer(chatId, transactionId, localId);
+              if (isTerminalReceiveResult(last)) {
+                return last;
+              }
+              if (attempt < RECEIVE_TRANSFER_MAX_ATTEMPTS) {
+                console.warn(
+                  `[wechat:${account.accountId}] receive transfer in ${chatId} not received ` +
+                    `(attempt ${attempt}/${RECEIVE_TRANSFER_MAX_ATTEMPTS}, error=${last.error ?? "unknown"}); ` +
+                    `re-clicking the transfer bubble`,
+                );
+                await sleep(RECEIVE_TRANSFER_RETRY_DELAY_MS);
+              }
+            }
+            // Non-null: the loop runs at least once (MAX_ATTEMPTS >= 1).
+            return last as ReceivePaymentResult;
+          },
         );
         const amount = result.amountText ? ` ${result.amountText}` : "";
         const details = [

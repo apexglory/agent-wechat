@@ -66,6 +66,79 @@ test("wechat_receive_transfer posts the targeted transfer request", async () => 
   }
 });
 
+function mockReceiveResponses(bodies: Array<Record<string, unknown>>) {
+  const calls: string[] = [];
+  let i = 0;
+  globalThis.fetch = async (input: URL | RequestInfo) => {
+    calls.push(String(input));
+    const body = bodies[Math.min(i, bodies.length - 1)];
+    i++;
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  return calls;
+}
+
+test("wechat_receive_transfer retries a transient miss until it succeeds (re-click)", async () => {
+  const tool = createWeChatReceiveTransferTool(baseAccount());
+  const originalFetch = globalThis.fetch;
+  // First two calls fail with the transient "dialog never opened" outcome; the
+  // third succeeds — mirroring a re-click finally landing the receipt.
+  const calls = mockReceiveResponses([
+    { success: false, kind: "transfer", localId: 16, error: "TRANSFER_NOT_RECEIVED" },
+    { success: false, kind: "transfer", localId: 16, error: "TRANSFER_NOT_RECEIVED" },
+    {
+      success: true,
+      kind: "transfer",
+      localId: 16,
+      amountText: "￥3.90",
+      receivedAt: "2026-06-04T10:00:00Z",
+    },
+  ]);
+
+  try {
+    const result = await tool.execute("tool-call", { chatId: "wechat:APEX_GLORY", localId: 16 });
+    assert.equal(calls.length, 3, "should re-issue the receive (re-click) until success");
+    assert.match(result.content[0]?.text ?? "", /Received the WeChat transfer ￥3.90/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("wechat_receive_transfer does NOT retry terminal failures", async () => {
+  const tool = createWeChatReceiveTransferTool(baseAccount());
+  const originalFetch = globalThis.fetch;
+  const calls = mockReceiveResponses([
+    { success: false, kind: "transfer", localId: 16, error: "TRANSFER_NOT_RECEIVABLE" },
+  ]);
+
+  try {
+    const result = await tool.execute("tool-call", { chatId: "wechat:APEX_GLORY", localId: 16 });
+    assert.equal(calls.length, 1, "a re-click can't fix a non-receivable transfer; don't burn attempts");
+    assert.match(result.content[0]?.text ?? "", /Failed to receive/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("wechat_receive_transfer gives up after the attempt ceiling on a persistent miss", async () => {
+  const tool = createWeChatReceiveTransferTool(baseAccount());
+  const originalFetch = globalThis.fetch;
+  const calls = mockReceiveResponses([
+    { success: false, kind: "transfer", localId: 16, error: "TRANSFER_NOT_RECEIVED" },
+  ]);
+
+  try {
+    const result = await tool.execute("tool-call", { chatId: "wechat:APEX_GLORY", localId: 16 });
+    assert.equal(calls.length, 3, "bounded to MAX_ATTEMPTS, not infinite");
+    assert.match(result.content[0]?.text ?? "", /Failed to receive/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("formatPaymentBody includes status and targeting metadata", () => {
   const text = formatPaymentBody({
     localId: 16,
