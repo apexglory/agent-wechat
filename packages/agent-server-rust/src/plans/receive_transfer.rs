@@ -143,6 +143,28 @@ fn click_transfer_card(bubble: &Bounds, list_bounds: Option<&Bounds>, is_self: b
     actions::click_at(x, y)
 }
 
+/// Is the card's vertical center inside the Messages viewport?
+///
+/// `find_transfer_message` walks the a11y tree, which includes message rows
+/// that WeChat keeps rendered but has scrolled OUTSIDE the visible viewport
+/// (it renders a window of rows around the current scroll position). Such an
+/// off-screen card is returned at `find_attempts=0` just like a visible one.
+/// Clicking it is futile: `click_transfer_card` clips the click Y to the
+/// viewport, so a card whose center is above (or below) the viewport collapses
+/// to a point on the chat header / input area and the receive dialog never
+/// opens — ClickingReceive then times out. We require the card's center to be
+/// within the viewport before clicking; if it isn't, the caller scrolls toward
+/// it first. With no viewport info we optimistically allow the click.
+fn card_center_in_viewport(bubble: &Bounds, list_bounds: Option<&Bounds>) -> bool {
+    match list_bounds {
+        Some(lb) => {
+            let center_y = bubble.y + bubble.height / 2.0;
+            center_y >= lb.y && center_y <= lb.y + lb.height
+        }
+        None => true,
+    }
+}
+
 fn is_transfer_dialog_frame(frame: &A11yNode) -> bool {
     query_selector(frame, MAIN_CHAT_SELECTOR).is_none()
         && query_selector(frame, r#"list[name="Messages"]"#).is_none()
@@ -425,6 +447,65 @@ impl Plan for ReceiveTransferPlan {
                     if let Some(node) = transfer_node {
                         if let Some(bounds) = &node.bounds {
                             let list_b = message_list_bounds(a11y).cloned();
+
+                            // A found card can still be scrolled OUT of the viewport (old
+                            // transfer with many later messages — opening the chat lands at
+                            // the bottom, the card sits far above and is only rendered, not
+                            // visible). Clicking it lands on the chat header (see
+                            // click_transfer_card) and the dialog never opens. Observed
+                            // 2026-06-04: 小水's ¥3.90 received 8h late, ClickingReceive timed
+                            // out ~20x and starved outbound pushes. Same-moment receives work
+                            // because the card is the latest message, visible at the bottom.
+                            // Scroll the card into view before clicking; bound by find_attempts.
+                            if !card_center_in_viewport(bounds, list_b.as_ref()) {
+                                plan_state.find_attempts += 1;
+                                if plan_state.find_attempts > 12 {
+                                    tracing::warn!(
+                                        "[receive_transfer] None@ClickingTransfer: card off-screen, scroll exhausted for chat={} amount={:?}",
+                                        params.chat_id, params.amount_text
+                                    );
+                                    return None;
+                                }
+                                // center above viewport → older → scroll up; below → scroll down
+                                let direction = match list_b.as_ref() {
+                                    Some(lb) if bounds.y + bounds.height / 2.0 > lb.y + lb.height => {
+                                        ScrollDirection::Down
+                                    }
+                                    _ => ScrollDirection::Up,
+                                };
+                                tracing::info!(
+                                    "[receive_transfer] card off-screen (card_y={:.0} h={:.0} list_y={:?}), scrolling {:?} (find_attempts={})",
+                                    bounds.y,
+                                    bounds.height,
+                                    list_b.as_ref().map(|b| b.y),
+                                    direction,
+                                    plan_state.find_attempts,
+                                );
+                                let scroll = Action::Scroll {
+                                    direction,
+                                    x: None,
+                                    y: None,
+                                    amount: Some(if params.explicit_target { 5 } else { 3 }),
+                                };
+                                let action = match message_list_bounds(a11y) {
+                                    // click the list first to put the cursor over it, so the
+                                    // wheel scroll targets the message list (Scroll ignores x/y)
+                                    Some(lb) => actions::sequence(vec![
+                                        actions::click_bounds(lb),
+                                        scroll,
+                                        actions::wait_short(),
+                                    ]),
+                                    None => actions::sequence(vec![scroll, actions::wait_short()]),
+                                };
+                                return Some(SelectedAction {
+                                    action,
+                                    frame: identified
+                                        .main_window
+                                        .as_ref()
+                                        .and_then(|m| m.frame.clone()),
+                                });
+                            }
+
                             plan_state.phase = ReceiveTransferPhase::ClickingReceive;
                             return Some(SelectedAction {
                                 action: actions::sequence(vec![
@@ -521,9 +602,27 @@ impl Plan for ReceiveTransferPlan {
                     }
 
                     plan_state.receive_attempts += 1;
-                    if plan_state.receive_attempts > 20 {
+                    // Fast-fail the popup wait. ClickingTransfer already clicked the card
+                    // exactly once; this phase only *waits* for the accept dialog and never
+                    // re-clicks, so a single ineffective click (card already received on
+                    // another client but still cached as receivable, stale bounds, missed
+                    // hit) can never recover within the attempt — it just polls until the
+                    // ceiling. Each poll is an a11y+screenshot capture (~3s) and the whole
+                    // run holds the global ui_mutex (see router::messages::receive_transfer),
+                    // so a doomed wait starves every other UI action — outbound sends/pushes
+                    // included — for its full duration. At 20 that was ~75s; the agent then
+                    // retries, stacking 75s stalls back-to-back (observed 2026-06-04: order
+                    // 383 / 小水, starved the CUSTOMER_PUSH_FAILED burst on orders 380/376/384).
+                    // The happy path finds the dialog within 1-3 polls, so 8 leaves ample
+                    // headroom for a slow UI while capping the mutex hold at ~25s. Failing
+                    // fast is cheap and correct: the caller re-opens + re-clicks on its next
+                    // attempt (that retry IS the re-click), and once the transfer is actually
+                    // received the handler short-circuits on is_received before ever running
+                    // this FSM.
+                    if plan_state.receive_attempts > 8 {
                         tracing::warn!(
-                            "[receive_transfer] None@ClickingReceive: timeout waiting for accept button popup"
+                            "[receive_transfer] None@ClickingReceive: timeout waiting for accept button popup (gave up after {} polls to release ui_mutex)",
+                            plan_state.receive_attempts
                         );
                         return None;
                     }
@@ -655,8 +754,9 @@ impl Plan for ReceiveTransferPlan {
 #[cfg(test)]
 mod tests {
     use super::{
-        click_transfer_card, find_success_dialog_frame, find_transfer_dialog_frame,
-        is_receivable_transfer_item_name, SUCCESS_SELECTOR, WINDOW_CLOSE_SELECTOR,
+        card_center_in_viewport, click_transfer_card, find_success_dialog_frame,
+        find_transfer_dialog_frame, is_receivable_transfer_item_name, SUCCESS_SELECTOR,
+        WINDOW_CLOSE_SELECTOR,
     };
     use crate::ia::selectors::query_selector;
     use crate::ia::types::{A11yNode, Action, Bounds};
@@ -759,6 +859,58 @@ mod tests {
             Action::ClickCoords { x: _, y } => assert_eq!(y, 561.0),
             _ => panic!("expected click coords"),
         }
+    }
+
+    #[test]
+    fn card_center_in_viewport_detects_offscreen_card() {
+        let list = Bounds {
+            x: 404.0,
+            y: 101.0,
+            width: 704.0,
+            height: 490.0, // viewport y: 101..591
+        };
+
+        // Old transfer scrolled far above the viewport (only rendered, not
+        // visible): center well above list top → must NOT click, scroll instead.
+        let above = Bounds {
+            x: 404.0,
+            y: -200.0,
+            width: 704.0,
+            height: 111.0,
+        };
+        assert!(!card_center_in_viewport(&above, Some(&list)));
+
+        // Partially clipped at the top but center still above viewport (the old
+        // 2026-05-28 case) → also treated as off-screen now (scroll into view).
+        let clipped_top = Bounds {
+            x: 404.0,
+            y: 44.0,
+            width: 704.0,
+            height: 111.0, // center = 99.5, just above list top 101
+        };
+        assert!(!card_center_in_viewport(&clipped_top, Some(&list)));
+
+        // Latest transfer sitting visible at the bottom (the normal success
+        // shape, find_attempts=0) → click directly.
+        let visible = Bounds {
+            x: 404.0,
+            y: 505.0,
+            width: 704.0,
+            height: 111.0, // center = 560.5, inside 101..591
+        };
+        assert!(card_center_in_viewport(&visible, Some(&list)));
+
+        // Scrolled below the viewport → off-screen.
+        let below = Bounds {
+            x: 404.0,
+            y: 620.0,
+            width: 704.0,
+            height: 111.0,
+        };
+        assert!(!card_center_in_viewport(&below, Some(&list)));
+
+        // No viewport info → optimistically allow the click.
+        assert!(card_center_in_viewport(&above, None));
     }
 
     fn node(role: &str, name: &str, children: Vec<A11yNode>) -> A11yNode {
