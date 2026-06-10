@@ -1,32 +1,37 @@
-# Base compose for the agent-wechat container.
+# Base compose for the agent-wechat2 container.
 #
-# Per-host bits (network_mode, volume names, proxy env, ...) live in a
-# local docker-compose.override.yml that is gitignored. Compose merges
-# both files automatically when you run `docker compose up` from this
-# directory. See dev-notes/compose-override-examples.md for samples.
+# Production images are NOT pulled from a registry (GHCR is unreachable from the
+# CN hosts). They are built once and shipped with `scripts/ship-image.sh`
+# (docker save | ssh docker load), then run from the locally-loaded image.
 #
-# Env vars set here are environment-agnostic and required by every
-# deployment:
+# Per-host bits (image version, volume names, port, token path, proxy) live in a
+# gitignored `.env` next to this file — copy `.env.example` and fill it in.
+# Compose auto-loads `.env`. Optionally a `docker-compose.override.yml` can add
+# structural bits (network_mode, extra env) that don't fit scalar vars.
+#
+# Env vars set here are environment-agnostic and required by every deployment:
 #   - TZ: WeChat UI defaults to UTC without it
-#   - LANG / LC_ALL: WeChat 4.x writes empty X11 WM_NAME for non-ASCII
-#     chat titles under POSIX locale (xdotool search returns 0 hits,
-#     sendFast fails, fallback sendMessage surfaces 'No action selected')
+#   - LANG / LC_ALL: WeChat 4.x writes empty X11 WM_NAME for non-ASCII chat
+#     titles under POSIX locale (xdotool search returns 0 hits, sendFast fails)
 
 services:
   agent-wechat:
-    image: ghcr.io/thisnick/agent-wechat:0.11.15
-    container_name: agent-wechat
+    # Pinned, locally-loaded tag (e.g. agent-wechat2:0.12.0). Set in .env.
+    image: ${AGENT_WECHAT_IMAGE:?set AGENT_WECHAT_IMAGE in .env (e.g. agent-wechat2:0.12.0)}
+    # Image arrives via `docker load`, never from a registry — don't try to pull.
+    pull_policy: never
+    container_name: ${AGENT_WECHAT_CONTAINER:-agent-wechat2}
     security_opt:
       - seccomp=unconfined
     cap_add:
       - SYS_PTRACE
       - NET_ADMIN
     ports:
-      - "6174:6174"
+      - "${AGENT_WECHAT_PORT:-6174}:6174"
     volumes:
-      - agent-wechat-data:/data
-      - agent-wechat-home:/home/wechat
-      - /root/.config/agent-wechat/token:/data/auth-token:ro
+      - data:/data
+      - wechat-home:/home/wechat
+      - ${AGENT_WECHAT_TOKEN:-/root/.config/agent-wechat2/token}:/data/auth-token:ro
     environment:
       - DISPLAY=:99
       - AGENT_DB_PATH=/data/agent.db
@@ -36,10 +41,15 @@ services:
       - LC_ALL=C.UTF-8
     restart: unless-stopped
 
+# Both volumes are EXTERNAL and their real names MUST be supplied via .env. This
+# is deliberate: a fresh `compose up` then FAILS LOUDLY rather than silently
+# creating empty volumes and wiping a logged-in WeChat session. To migrate an
+# existing host onto the image flow with ZERO data copy, point these at the
+# volumes the old `agent-wechat` container already uses (see .env.example).
 volumes:
-  # Both volumes are external — override must supply the actual volume name
-  # via `name:` to match what the legacy container created on this host.
-  agent-wechat-data:
+  data:
     external: true
-  agent-wechat-home:
+    name: ${AGENT_WECHAT_DATA_VOLUME:?set AGENT_WECHAT_DATA_VOLUME in .env (existing data volume to reuse)}
+  wechat-home:
     external: true
+    name: ${AGENT_WECHAT_HOME_VOLUME:?set AGENT_WECHAT_HOME_VOLUME in .env (existing wechat-home volume to reuse)}
