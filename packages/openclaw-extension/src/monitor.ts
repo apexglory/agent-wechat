@@ -467,6 +467,20 @@ export async function startWeChatMonitor(
   // Buffer non-mentioned group messages for catch-up context
   const groupHistory = new Map<string, ProcessedMessage[]>();
   const GROUP_HISTORY_LIMIT = 50;
+
+  // Sticky deny-list of display names whose wxid we've ever seen match
+  // `isAutomationIgnoredChatId` (e.g. `gh_*` official accounts). The a11y
+  // auto-open path (Rust) leads WCDB's batched SessionTable flush by ~9s,
+  // while the per-poll skip-list below is sourced from `listChats` (WCDB) —
+  // so on a *fresh* gh_ message the live a11y tree already shows the unread
+  // badge before WCDB lists the session, the name is missing from this
+  // poll's projection, and the chat gets auto-clicked open (which navigates
+  // the main window into the official-account list and wedges all further
+  // automation). Accumulating names sticky across polls closes that race:
+  // once a gh_ chat has been listed even once, its name stays skipped even
+  // in the WCDB-lag window. Official-account names are stable and few, so
+  // the set stays tiny.
+  const stickyAutoOpenSkipNames = new Set<string>();
   let lastAuthCheck = 0;
   let prevStatus: AuthStatus["status"] | undefined = undefined;
 
@@ -558,13 +572,16 @@ export async function startWeChatMonitor(
         continue;
       }
 
-      const autoOpenSkipNames: string[] = [];
       for (const c of chats) {
         const wxid = c.username ?? c.id;
         if (!wxid || !c.name) continue;
         if (wxid.includes("@chatroom")) continue;
-        if (isAutomationIgnoredChatId(wxid)) autoOpenSkipNames.push(c.name);
+        if (isAutomationIgnoredChatId(wxid)) stickyAutoOpenSkipNames.add(c.name);
       }
+      // Union of names seen this poll and every prior poll — see
+      // `stickyAutoOpenSkipNames` above for why the sticky accumulation is
+      // required (WCDB lag vs a11y lead).
+      const autoOpenSkipNames = [...stickyAutoOpenSkipNames];
 
       // ---- A11y fast-path probe ----
       // Triggers auto-double-click on any chat that has an unread badge in
